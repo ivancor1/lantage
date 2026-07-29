@@ -1,0 +1,296 @@
+@import "tailwindcss";
+
+/*
+ * Lantage design tokens.
+ * Values marked MEASURED were read from flysoar.ai's shipped CSS (2026-07-29).
+ * See docs/DESIGN_SYSTEM.md for provenance and rules.
+ *
+ * Dark only. Monochrome. Colour carries meaning, never decoration.
+ */
+
+@theme {
+  --font-sans: "Switzer", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Neutrals — MEASURED (off-black, blue-tinted) */
+  --color-n-0: #08080c;
+  --color-n-50: #0d1016;
+  --color-n-100: #141821;
+  --color-n-150: #1f2530;
+  --color-n-200: #2b3340;
+  --color-n-300: #374151;
+  --color-n-400: #4b5563;
+  --color-n-500: #9aa1ab;
+
+  /* Foreground — MEASURED */
+  --color-fg: #ffffff;
+  --color-fg-secondary: #ffffffb8;
+  --color-fg-tertiary: #ffffff75;
+
+  /* Hairlines — MEASURED */
+  --color-border: #ffffff1f;
+  --color-border-strong: #ffffff3d;
+
+  /* Signal — MEASURED hues, DERIVED semantics.
+     signal  = high/moderate confidence, confirmed
+     caution = degraded input, weak confidence
+     alert   = refused, unmatchable */
+  --color-signal: #78e6a0;
+  --color-caution: #ffb066;
+  --color-alert: #ff8aa0;
+
+  /* Radius — MEASURED */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.625rem;
+  --radius-lg: 0.875rem;
+  --radius-xl: 1.125rem;
+  --radius-2xl: 1.5rem;
+  --radius-frame: 24px;
+  --radius-nested: 20px;
+
+  /* Easing — MEASURED */
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-morph: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  color-scheme: dark;
+
+  --map-shell: #000;
+
+  /* Status fills — signal hue at ~13% */
+  --signal-dim: #78e6a021;
+  --caution-dim: #ffb06624;
+  --alert-dim: #ff8aa024;
+
+  /* Theme-flipping alpha ramp — MEASURED. Use these instead of raw rgba. */
+  --w-05: #ffffff0d;
+  --w-1: #ffffff1a;
+  --w-2: #ffffff33;
+  --w-3: #ffffff4d;
+  --w-5: #ffffff80;
+  --w-7: #ffffffb3;
+  --w-9: #ffffffe6;
+
+  /* Glass — three tiers, MEASURED. Do not invent a fourth. */
+  --glass-scrim: blur(11px) saturate(112%);
+  --glass-pill: blur(16px) saturate(135%);
+  --glass-heavy: blur(28px) saturate(150%);
+
+  /* Card surfaces — near-opaque, NOT blurred. MEASURED. */
+  --glass-1: #08080cf2;
+  --glass-2: #0a0a0edb;
+  --glass-3: #14141ae6;
+  --modal-surface: #0a0a0a;
+
+  /* Shadows — dark mode lifts rather than drops. MEASURED. */
+  --shadow-lift: 0 0 1px #ffffff2e, inset 0 0 2px #ffffff0a;
+  --shadow-lg: 0 16px 30px -12px #000000a6, 0 6px 12px -8px #0000008c;
+  --shadow-pill: inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 10px 28px -18px rgba(0, 0, 0, 0.42);
+
+  /* Durations — MEASURED */
+  --d-hover: 140ms;
+  --d-base: 150ms;
+  --d-scrim: 180ms;
+  --d-cta: 200ms;
+  --d-panel: 340ms;
+}
+
+html,
+body {
+  background: var(--color-n-50);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  /* MEASURED: 14px base, not 16. Whole app runs slightly tight. */
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Headings are medium, never bold — this is what reads as instrument panel. */
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.08;
+}
+
+/* Coordinates, confidence, counts — always tabular. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Universal focus — MEASURED */
+:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px rgba(154, 161, 171, 0.5),
+    0 0 0 3px var(--color-n-50);
+}
+
+/* ---- Glass primitives ---------------------------------------------------- */
+
+/* Floating chrome. Blurred. */
+.glass-pill {
+  border-radius: 9999px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 72%, transparent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-n-0) 68%, transparent) 0%,
+    color-mix(in srgb, var(--color-n-0) 46%, transparent) 100%
+  );
+  box-shadow: var(--shadow-pill);
+  backdrop-filter: var(--glass-pill);
+  -webkit-backdrop-filter: var(--glass-pill);
+  transform: translateZ(0);
+}
+
+/* Cards are NOT blurred — near-opaque tint + hairline. MEASURED.
+   Blurring cards over a live map destroys legibility and costs frames. */
+.glass-card {
+  border-radius: var(--radius-frame);
+  border: 1px solid var(--color-border);
+  background: var(--glass-1);
+  box-shadow: var(--shadow-lift);
+}
+
+/* Progressive-blur header scrim. The glass is on THIS, not on the header,
+   and it fades its own blur out with a mask. MEASURED. */
+.glass-scrim {
+  position: fixed;
+  inset-inline: 0;
+  top: 0;
+  height: 112px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-n-50) 58%, transparent) 0%,
+    color-mix(in srgb, var(--color-n-50) 28%, transparent) 48%,
+    transparent 100%
+  );
+  backdrop-filter: var(--glass-scrim);
+  -webkit-backdrop-filter: var(--glass-scrim);
+  mask-image: linear-gradient(to bottom, #000 0%, #000 46%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 46%, transparent 100%);
+  transform: translateZ(0);
+  will-change: opacity;
+  transition: opacity var(--d-scrim) ease;
+}
+
+@media (max-width: 820px) {
+  .glass-scrim {
+    height: 83px;
+  }
+  /* MEASURED: flysoar drops blur on small screens. So do we. */
+  .glass-pill {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
+/* Kill blur while the map animates — blur over a moving canvas is the single
+   biggest frame cost in this UI. Toggle .map-animating on <html>. */
+.map-animating .glass-pill,
+.map-animating .glass-scrim {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* ---- Eyebrow labels ----------------------------------------------------- */
+
+/* The signature investigative-panel label. Use for every panel title,
+   pipeline stage, and status annotation. */
+.eyebrow-mono {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-fg-tertiary);
+}
+
+.eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--color-fg-tertiary);
+}
+
+/* ---- Motion ------------------------------------------------------------- */
+
+/* House entrance animation — MEASURED "blur-in reveal". */
+@keyframes blur-in {
+  from {
+    opacity: 0;
+    filter: blur(8px);
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0);
+  }
+}
+
+.blur-in {
+  animation: blur-in var(--d-panel) var(--ease-spring) both;
+}
+
+/* "Analyzing…" shimmer — MEASURED, background-clip text sweep. */
+@keyframes shimmer-sweep {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-fg-tertiary) 0%,
+    var(--color-fg) 50%,
+    var(--color-fg-tertiary) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer-sweep 1.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* MapLibre dark overrides — default control chrome is light and breaks the shell. */
+.maplibregl-ctrl-group {
+  background: var(--glass-2) !important;
+  border: 1px solid var(--color-border) !important;
+  box-shadow: var(--shadow-lift) !important;
+}
+.maplibregl-ctrl-group button + button {
+  border-top-color: var(--color-border) !important;
+}
+.maplibregl-ctrl-icon {
+  filter: invert(1) opacity(0.7);
+}
+.maplibregl-ctrl-attrib {
+  background: rgba(0, 0, 0, 0.6) !important;
+  color: var(--color-fg-tertiary) !important;
+}
+.maplibregl-ctrl-attrib a {
+  color: var(--color-fg-secondary) !important;
+}

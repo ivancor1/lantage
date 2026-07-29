@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env*.local
+.DS_Store
+*.pem
+.vercel
+next-env.d.ts
+.turbo/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/harvest/
