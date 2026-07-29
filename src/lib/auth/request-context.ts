@@ -1,87 +1,78 @@
 /**
- * Request context capture — the IP, user agent, and request id that every audit
- * row needs.
+ * Request context capture — the IP, user agent, and request id every audit row
+ * needs.
  *
- * Why this is a module and not three `headers().get()` calls at each call site:
- * the Next 16 proxy docs are explicit that the only supported channels from
- * proxy into the app are headers, cookies, rewrites, and the URL — "you should
- * not attempt relying on shared modules or globals". So `proxy.ts` derives the
- * context once and stamps it onto the *request* headers with
+ * Why this is a module and not three `headers().get()` calls per call site: the
+ * Next 16 proxy docs are explicit that the only supported channels from proxy
+ * into the app are headers, cookies, rewrites, and the URL — "you should not
+ * attempt relying on shared modules or globals". So `proxy.ts` derives the
+ * context once and stamps it onto the *forwarded request* via
  * `NextResponse.next({ request: { headers } })`, and Server Components / Route
  * Handlers read it back with `await headers()`.
  *
- * The `x-lantage-*` names are internal. Trusting a client-supplied
- * `x-lantage-ip` would let a caller forge its own audit trail, so
- * `readRequestContext` marks any value that did not come through the proxy as
- * untrusted — see `RequestContext.trusted`.
+ * X-Forwarded-For parsing is NOT reimplemented here. A2's `normalizeIp` in
+ * `src/lib/db/queries/audit.ts` is the single place that knows how to reduce a
+ * forwarding chain to something Postgres `inet` accepts, and it deliberately
+ * preserves an unparseable value rather than dropping it. This module only
+ * decides *which* header to feed it and whether the result is trustworthy.
  */
 
-/** Internal header names. Keep in sync with `proxy.ts` — it is the only writer. */
+import { auditContextFromHeaders, normalizeIp } from '@/lib/db/queries/audit';
+
+/** Internal header names. Keep in sync with `proxy.ts` — its only writer. */
 export const CTX_HEADERS = {
   ip: 'x-lantage-ip',
   userAgent: 'x-lantage-ua',
   requestId: 'x-lantage-request-id',
   path: 'x-lantage-path',
   /**
-   * Proof the proxy ran. Compared against `LANTAGE_PROXY_SECRET` so a client
-   * cannot hand-roll the four headers above and poison the audit trail. Without
-   * the env var set we still work, but every context is marked untrusted.
+   * Proof the proxy handled this request, compared against
+   * `LANTAGE_PROXY_SECRET`. Without it a caller could hand-roll the four headers
+   * above and write a false IP into the audit trail — which for a tool built for
+   * defence discovery is the one forgery that matters. Unset in local dev, which
+   * costs only the `trusted` flag.
    */
   stamp: 'x-lantage-proxy-stamp',
 } as const;
 
 export interface RequestContext {
-  /** Client IP, best effort. `null` when nothing usable was present. */
+  /** Client IP, normalised by A2's `normalizeIp`. `null` when nothing usable. */
   readonly ip: string | null;
   readonly userAgent: string | null;
-  /** Correlates the audit rows written while serving one request. */
+  /** Correlates every audit row written while serving one request. */
   readonly requestId: string;
   readonly path: string | null;
   /**
-   * `true` only when the proxy stamped these values in this request. A `false`
-   * here in a production audit row means someone bypassed the proxy — worth
-   * alerting on, and the reason this flag is persisted rather than dropped.
+   * `true` only when the proxy stamped these values on this request. A `false`
+   * in a production audit row means something reached a handler without passing
+   * through the proxy — worth alerting on, which is why the flag is persisted
+   * into `detail` rather than dropped.
    */
   readonly trusted: boolean;
 }
 
 /**
- * First entry in `x-forwarded-for` is the client; the rest are proxies.
+ * Which forwarding header to believe. Vercel and Cloudflare disagree about which
+ * is authoritative, so the order is deliberate: `x-forwarded-for` first because
+ * the platform overwrites its leftmost entry.
  *
- * `x-forwarded-for` is spoofable in general. On Vercel the platform overwrites
- * the leftmost entry, so it is trustworthy *there* and only there. Self-hosting
- * behind another proxy requires re-checking this. Recorded as best-effort
- * evidence, never used as an authorization input.
+ * Spoofable in general. Recorded as best-effort evidence, never used as an
+ * authorization input.
  */
-export function clientIpFrom(headers: Headers): string | null {
-  const xff = headers.get('x-forwarded-for');
-  if (xff) {
-    const first = xff.split(',')[0]?.trim();
-    if (first) return normaliseIp(first);
-  }
-  const alternatives = ['x-real-ip', 'cf-connecting-ip', 'x-vercel-forwarded-for'];
-  for (const name of alternatives) {
-    const v = headers.get(name)?.trim();
-    if (v) return normaliseIp(v);
-  }
-  return null;
+function forwardedFor(headers: Headers): string | null {
+  return (
+    headers.get('x-forwarded-for') ??
+    headers.get('x-real-ip') ??
+    headers.get('cf-connecting-ip') ??
+    headers.get('x-vercel-forwarded-for') ??
+    null
+  );
 }
 
-function normaliseIp(raw: string): string | null {
-  // Strip an IPv4-mapped IPv6 prefix and any :port suffix, and cap the length so
-  // a hostile header cannot bloat every audit row.
-  let v = raw.replace(/^::ffff:/i, '');
-  const portMatch = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(v);
-  if (portMatch?.[1]) v = portMatch[1];
-  v = v.slice(0, 45);
-  return v.length > 0 ? v : null;
-}
-
-/** Truncated: audit rows are queried in bulk for discovery, and UA strings bloat. */
-export function userAgentFrom(headers: Headers): string | null {
+/** Truncated: audit rows are read in bulk for discovery, and UA strings bloat. */
+function userAgentFrom(headers: Headers): string | null {
   const ua = headers.get('user-agent');
-  if (!ua) return null;
-  return ua.slice(0, 512);
+  return ua ? ua.slice(0, 512) : null;
 }
 
 export function newRequestId(): string {
@@ -89,20 +80,20 @@ export function newRequestId(): string {
 }
 
 /**
- * Derive the context from raw request headers. Pure — called by `proxy.ts`,
- * which then stamps the result onto the forwarded request.
+ * Derive the context from an incoming request. Pure. Called by `proxy.ts`, which
+ * then stamps the result onto the forwarded request headers.
  */
 export function deriveRequestContext(request: {
   headers: Headers;
   url?: string;
   nextUrl?: { pathname: string };
 }): RequestContext {
-  const path = request.nextUrl?.pathname ?? safePathname(request.url);
+  const { ip } = normalizeIp(forwardedFor(request.headers));
   return {
-    ip: clientIpFrom(request.headers),
+    ip,
     userAgent: userAgentFrom(request.headers),
     requestId: newRequestId(),
-    path,
+    path: request.nextUrl?.pathname ?? safePathname(request.url),
     trusted: true,
   };
 }
@@ -116,7 +107,7 @@ function safePathname(url: string | undefined): string | null {
   }
 }
 
-/** Values the proxy stamps onto the forwarded request. */
+/** The `x-lantage-*` pairs the proxy stamps onto the forwarded request. */
 export function contextHeaderEntries(ctx: RequestContext): Array<readonly [string, string]> {
   const entries: Array<readonly [string, string]> = [[CTX_HEADERS.requestId, ctx.requestId]];
   if (ctx.ip) entries.push([CTX_HEADERS.ip, ctx.ip]);
@@ -127,34 +118,44 @@ export function contextHeaderEntries(ctx: RequestContext): Array<readonly [strin
   return entries;
 }
 
-/**
- * Shared secret proving the proxy handled this request. Server-only env var —
- * never `NEXT_PUBLIC_`. Absent in local dev, which only costs us the `trusted`
- * flag.
- */
+/** Server-only env var. Never `NEXT_PUBLIC_`. */
 function proxyStamp(): string | null {
   return process.env.LANTAGE_PROXY_SECRET ?? null;
 }
 
 /**
  * Read the context back inside a Server Component, Server Function, or Route
- * Handler. Pass the result of `await headers()`.
+ * Handler. Pass the result of `await headers()`, or a Route Handler's
+ * `request.headers`.
  *
- * Never throws. A missing context yields a null-ip, untrusted context rather
- * than blocking the request: refusing to *serve* because we could not identify
- * the caller's IP would be the wrong trade, but refusing to *trust* it is right.
+ * Never throws. A missing context yields an untrusted context rather than
+ * blocking: refusing to *serve* because we could not identify the caller's IP
+ * would be the wrong trade — refusing to *trust* it is the right one.
  */
 export function readRequestContext(headers: Headers): RequestContext {
   const expected = proxyStamp();
   const presented = headers.get(CTX_HEADERS.stamp);
   const trusted = expected !== null && presented !== null && timingSafeEqualStr(expected, presented);
 
+  if (trusted) {
+    return {
+      ip: headers.get(CTX_HEADERS.ip),
+      userAgent: headers.get(CTX_HEADERS.userAgent) ?? userAgentFrom(headers),
+      requestId: headers.get(CTX_HEADERS.requestId) ?? newRequestId(),
+      path: headers.get(CTX_HEADERS.path),
+      trusted: true,
+    };
+  }
+
+  // Untrusted path: ignore anything claiming to be a stamped value and re-derive
+  // from the raw forwarding headers. Same parser, no privilege.
+  const derived = auditContextFromHeaders(headers);
   return {
-    ip: trusted ? headers.get(CTX_HEADERS.ip) : clientIpFrom(headers),
-    userAgent: headers.get(CTX_HEADERS.userAgent) ?? userAgentFrom(headers),
+    ip: derived.ip ?? null,
+    userAgent: derived.userAgent ?? null,
     requestId: headers.get(CTX_HEADERS.requestId) ?? newRequestId(),
     path: headers.get(CTX_HEADERS.path),
-    trusted,
+    trusted: false,
   };
 }
 
@@ -167,5 +168,11 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 
 /** Context for work with no HTTP request behind it — cron, backfill, tests. */
 export function systemRequestContext(label: string): RequestContext {
-  return { ip: null, userAgent: `lantage-system/${label}`, requestId: newRequestId(), path: null, trusted: true };
+  return {
+    ip: null,
+    userAgent: `lantage-system/${label}`,
+    requestId: newRequestId(),
+    path: null,
+    trusted: true,
+  };
 }

@@ -5,68 +5,212 @@
  * interfaces in `deps.ts`. This file is where the real implementations get bound,
  * and it is imported for its side effect by `src/app/api/search/route.ts`.
  *
- * To wire a dependency: uncomment its import, adapt it to the interface in
- * `deps.ts`, and add it to the `registerCascadeRuntime` call. Nothing else in the
- * cascade changes. If an adapter needs more than a few lines of glue, the
- * interface in `deps.ts` is wrong — fix it there rather than reaching into a
- * stage.
- *
- * Until each is wired:
- *  - missing **auth** or **audit** -> `POST /api/search` returns 503, by design.
- *    A search that cannot be attributed to a verified user and written to an
- *    immutable audit row is not a search this product performs.
+ * Fail-closed vs. degrade, restated because it is the whole design:
+ *  - missing **auth** or **audit** -> `POST /api/search` returns 503. A search that
+ *    cannot be attributed to a verified user and written to an immutable audit row
+ *    is not a search this product performs.
  *  - missing **image store** -> 503, since there is nothing to analyse.
- *  - missing **vector index** -> the cascade runs and returns the coarse prior
- *    with `vpr-retrieval` skipped, and no candidate can claim street precision.
+ *  - missing **vector index** -> the cascade runs, returns the coarse prior with
+ *    `vpr-retrieval` skipped, and no candidate can claim street precision.
  */
 
-import { registerCascadeRuntime } from './deps';
+import 'server-only';
 
-// --- WIRE CROSS-AGENT MODULES HERE ----------------------------------------
-//
-// Checked against what has actually landed in the tree, so the remaining work is
-// mechanical rather than exploratory. Three adapter rules:
-//
-//   1. Their functions take a Supabase client as the first argument and throw on
-//      error. Ours return `Result<T, StageFailure>` and never throw. Every adapter
-//      is therefore: construct the client, try/catch, map the error to a
-//      `StageFailure` with an analyst-readable `reason`.
-//   2. Their rows are snake_case; ours are camelCase. Map field by field — do not
-//      pass a row through and hope.
-//   3. Their bbox order already matches ours ([minLon, minLat, maxLon, maxLat]) —
-//      confirmed in `src/lib/db/queries/retrieval.ts`. Do not "fix" it.
-//
-// A2 — src/lib/db (present):
-//   import { createServerSupabaseClient } from '@/lib/db/client';
-//   import { searchGeoCandidates, getImage, createSearch, finalizeSearch,
-//            insertGeoCandidates, insertAuthenticityResult, getSearch,
-//            writeAudit } from '@/lib/db';
-//
-//   • `searchGeoCandidates(client, { embedding, bbox, metro, indexBuild, limit,
-//     efSearch })` returns `GeoAnnHit[]` carrying both `distance` and `similarity`;
-//     map `mapillary_id` -> `mapillaryId`, `compass_angle` -> `compassAngle`,
-//     `thumb_url` -> `thumbUrl`. It THROWS on a non-512-d descriptor — catch that
-//     and return `failure('invalid-response', ...)` so a wrong model degrades the
-//     cascade instead of 500ing the request.
-//   • `getImage(client, imageId)` returns an `ImageRow` with `storage_path`, not a
-//     URL. `ImageStore.resolve` has to turn that into a signed URL (preferred) or
-//     bytes: a storage path alone is not something Modal or the VLM can fetch.
-//   • Persistence is three calls, not one: `createSearch` -> `insertGeoCandidates`
-//     / `insertAuthenticityResult` -> `finalizeSearch`. Wrap them inside
-//     `SearchResultStore.save` and keep the whole `SearchResult`, stage traces and
-//     provenance included, or the result stops being reproducible.
-//   • Audit lives in `src/lib/db/queries/audit.ts` (`writeAudit`), not in
-//     `src/lib/audit`. Two rows per search, never an update.
-//
-// A3 — src/lib/auth (partially present: types, request-context, result, supabase):
-//   `canSearch` and `isModuleAllowed` do not exist yet. When they do, A3's
-//   `Gate<T>` (permit / refuse-with-code) maps onto `AuthGate` as:
-//   `isPermitted(gate) ? { allowed: true, principal } : { allowed: false,
-//   reason: gate.message, status: refusalStatus(gate.code) === 403 ? 403 : 401 }`.
-//   `verified` comes from their `VerificationStatus === 'verified'`, and
-//   `jurisdiction` from `Org.jurisdiction`.
-//
-// --------------------------------------------------------------------------
+import { createServerSupabaseClient } from '@/lib/db/client';
+import {
+  createSearch,
+  finalizeSearch,
+  getImage,
+  getSearch,
+  insertAuthenticityResult,
+  insertGeoCandidates,
+  searchGeoCandidates,
+  toSearchResult,
+} from '@/lib/db';
+import { cascadeAuthGate } from '@/lib/auth/guard';
+import { cascadeAuditWriter } from '@/lib/audit/cascade';
+
+import {
+  type ImageStore,
+  registerCascadeRuntime,
+  type SearchResultStore,
+} from './deps';
+import type { GeoVectorSearch } from './vprRetrieval';
+import { err, failure, ok, type Result, type StageFailure } from './types';
+
+/**
+ * Bucket holding uploaded evidence. `images.storage_path` is a path *within* this
+ * bucket, not a full URL — A2 deliberately stores the pointer rather than a URL so
+ * a bucket rename doesn't invalidate every historical row.
+ */
+const IMAGE_BUCKET = process.env.LANTAGE_IMAGE_BUCKET ?? 'evidence';
+
+/**
+ * Signed-URL lifetime. Long enough for Modal and the VLM to fetch, short enough
+ * that a URL leaking out of a log is not durable access to evidence.
+ */
+const SIGNED_URL_TTL_SECONDS = 300;
+
+/**
+ * A2's helpers throw on error; the cascade never throws across a boundary. This is
+ * the single place that translation happens.
+ */
+async function attempt<T>(
+  what: string,
+  kind: StageFailure['kind'],
+  fn: () => Promise<T>,
+): Promise<Result<T, StageFailure>> {
+  try {
+    return ok(await fn());
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    return err(failure(kind, `${what}: ${detail}`));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A2 — vector search
+// ---------------------------------------------------------------------------
+
+/**
+ * `bbox` is not optional here and must not become optional: it is the prune, and
+ * `search_geo_candidates` applies it as a WHERE before the `<=>` ordering. An
+ * unpruned planet-wide ANN scan is refused upstream in `vprRetrieval` with a
+ * `policy` failure rather than silently run.
+ *
+ * A2's bbox order already matches ours — [minLon, minLat, maxLon, maxLat]. Do not
+ * "fix" it.
+ */
+const vectorSearch: GeoVectorSearch = {
+  async searchGeoCandidates({ embedding, bbox, limit }) {
+    const client = await createServerSupabaseClient();
+
+    // A2 throws on a non-512-d descriptor. That is a wiring bug (wrong model
+    // requested), not a transport problem, so it maps to `invalid-response` and
+    // degrades the stage instead of 500ing the request.
+    const hits = await attempt('searchGeoCandidates', 'invalid-response', () =>
+      searchGeoCandidates(client, { embedding, bbox, limit }),
+    );
+    if (!hits.ok) return hits;
+
+    return ok({
+      hits: hits.value.map((h) => ({
+        mapillaryId: h.mapillary_id,
+        lat: h.lat,
+        lon: h.lon,
+        similarity: h.similarity,
+        compassAngle: h.compass_angle,
+        thumbUrl: h.thumb_url,
+        sequenceId: h.sequence_id ?? undefined,
+        capturedAt: h.captured_at ?? undefined,
+      })),
+      // Every hit carries the same build; pin it into provenance so a result stays
+      // reproducible against the exact index it was computed on.
+      indexBuild: hits.value[0]?.index_build,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// A2 — image store
+// ---------------------------------------------------------------------------
+
+const imageStore: ImageStore = {
+  async resolve({ imageId, orgId }) {
+    const client = await createServerSupabaseClient();
+
+    const row = await attempt('getImage', 'unavailable', () => getImage(client, imageId));
+    if (!row.ok) return row;
+    if (!row.value) {
+      return err(failure('no-input', `image ${imageId} not found`));
+    }
+
+    // Defence in depth. RLS already scopes this by org, but a mismatch here means
+    // something is wrong with the caller's scope and we should not analyse the
+    // image on the strength of an id alone.
+    if (row.value.org_id !== orgId) {
+      return err(failure('policy', `image ${imageId} does not belong to the requesting org`));
+    }
+
+    const signed = await attempt('createSignedUrl', 'unavailable', async () => {
+      const { data, error } = await client.storage
+        .from(IMAGE_BUCKET)
+        .createSignedUrl(row.value!.storage_path, SIGNED_URL_TTL_SECONDS);
+      if (error) throw error;
+      if (!data?.signedUrl) throw new Error('no signedUrl returned');
+      return data.signedUrl;
+    });
+    if (!signed.ok) return signed;
+
+    return ok({
+      imageId,
+      url: signed.value,
+      mimeType: row.value.mime,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// A2 — result persistence
+// ---------------------------------------------------------------------------
+
+const resultStore: SearchResultStore = {
+  async save({ result, orgId, userId, caseId }) {
+    const client = await createServerSupabaseClient();
+
+    return attempt('saveSearchResult', 'unavailable', async () => {
+      // Three calls, in this order. The row opens first so candidates have a
+      // search_id to hang off, and `finalizeSearch` stamps quality/stages/
+      // provenance last — those three columns are the only ones an authenticated
+      // caller is granted UPDATE on, so a bug that tries to rewrite `image_id` or
+      // `module` fails at the database rather than quietly changing what a past
+      // result claims to be about.
+      const row = await createSearch(client, {
+        module: result.module,
+        imageId: result.imageId,
+        caseId: caseId ?? null,
+        orgId,
+        createdBy: userId,
+      });
+
+      if (result.geo?.length) {
+        // insertGeoCandidates re-runs assertStreetPrecisionIsEarned per row, and
+        // the CHECK constraint enforces it again in SQL. Both layers stay.
+        await insertGeoCandidates(client, row.id, result.geo);
+      }
+      if (result.authenticity) {
+        await insertAuthenticityResult(client, row.id, result.authenticity);
+      }
+
+      await finalizeSearch(client, row.id, {
+        quality: result.quality,
+        stages: result.stages,
+        provenance: result.provenance,
+      });
+
+      return { id: row.id };
+    });
+  },
+
+  async get({ id, orgId }) {
+    const client = await createServerSupabaseClient();
+
+    const row = await attempt('getSearch', 'unavailable', () => getSearch(client, id));
+    if (!row.ok) return row;
+    if (!row.value) return ok(null);
+    if (row.value.org_id !== orgId) {
+      // Indistinguishable from "not found" on purpose — existence of another
+      // tenant's search id is not something to confirm.
+      return ok(null);
+    }
+
+    return ok(toSearchResult(row.value));
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
 
 let wired = false;
 
@@ -76,10 +220,11 @@ export function wireCascade(): void {
   wired = true;
 
   registerCascadeRuntime({
-    // vectorSearch: { searchGeoCandidates: adaptSearchGeoCandidates() },
-    // imageStore: { resolve: adaptResolveImage() },
-    // resultStore: { save: adaptSave(), get: adaptGet() },
-    // auth: { canSearch, isModuleAllowed },
-    // audit: { writeSearchAudit: adaptWriteAudit() },
+    vectorSearch,
+    imageStore,
+    resultStore,
+    // A3. Both are already typed against B2's `AuthGate` / `AuditWriter`.
+    auth: cascadeAuthGate,
+    audit: cascadeAuditWriter,
   });
 }

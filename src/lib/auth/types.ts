@@ -166,6 +166,12 @@ export interface Org {
    * the MATCH addendum does not get MATCH even in a permissive state.
    */
   readonly disabledModules: readonly string[];
+  /**
+   * Modules the contract explicitly turns ON. Only consulted for gated
+   * capabilities — currently MATCH, which is opt-in because of the CJIS fork
+   * rather than because of any city ordinance. See `REQUIRES_EXPLICIT_ENABLEMENT`.
+   */
+  readonly enabledModules: readonly string[];
 }
 
 /**
@@ -186,6 +192,14 @@ export interface AuthUser {
    * at load time so `canSearch` can record *why* it refused.
    */
   readonly isAnonymous: boolean;
+  /**
+   * False when the session is valid but no `app_users` row exists yet.
+   *
+   * Distinguished from "not signed in" on purpose: bouncing a signed-in user to
+   * /login because provisioning has not finished produces a redirect loop, since
+   * the session is genuinely valid. The UI says "your account is being set up".
+   */
+  readonly provisioned: boolean;
   /** Licence on file, if any. Drives the verification UI, not authorization. */
   readonly licence: { number: string | null; state: string | null; verifiedAt: string | null };
 }
@@ -202,6 +216,7 @@ export function authUserFromRows(
     verification: verificationFromRow(row),
     org,
     isAnonymous: opts.isAnonymous ?? false,
+    provisioned: true,
     licence: {
       number: row.license_number,
       state: row.license_state,
@@ -222,6 +237,7 @@ export function orgFromRow(
     customerType: CustomerType;
     jurisdiction: OrgJurisdiction;
     disabledModules?: readonly string[];
+    enabledModules?: readonly string[];
   },
 ): Org {
   return {
@@ -234,5 +250,6 @@ export function orgFromRow(
       county: classification.jurisdiction.county,
     },
     disabledModules: classification.disabledModules ?? [],
+    enabledModules: classification.enabledModules ?? [],
   };
 }

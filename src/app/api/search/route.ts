@@ -88,7 +88,15 @@ export async function POST(request: Request): Promise<Response> {
   if (!decision.allowed || !decision.principal) {
     return json(
       {
-        error: decision.status === 403 ? 'forbidden' : 'unauthorized',
+        // 503 is not an authorization outcome — it means the auth backend itself
+        // is unconfigured or unreachable. Labelling it "unauthorized" would send an
+        // operator to audit permissions instead of their environment.
+        error:
+          decision.status === 503
+            ? 'dependency-unavailable'
+            : decision.status === 403
+              ? 'forbidden'
+              : 'unauthorized',
         message: decision.reason ?? 'Not permitted to run a search.',
       },
       decision.status ?? 401,

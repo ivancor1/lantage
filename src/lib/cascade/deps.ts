@@ -71,11 +71,21 @@ export interface SearchPrincipal {
   jurisdiction?: string;
 }
 
-/** TODO(A3): implemented by `src/lib/auth`. Adapter notes in wiring.ts. */
+/**
+ * Implemented by `src/lib/auth/guard.ts` as `cascadeAuthGate`.
+ *
+ * `canSearch` must never throw — it returns a decision. `503` is part of that
+ * decision space because "the auth backend is unreachable or unconfigured" is a
+ * different fact from "you are not allowed", and collapsing it into 403 would tell
+ * an operator their credentials are wrong when the database is simply not wired.
+ */
 export interface AuthGate {
-  canSearch(
-    request: Request,
-  ): Promise<{ allowed: boolean; principal?: SearchPrincipal; reason?: string; status?: 401 | 403 }>;
+  canSearch(request: Request): Promise<{
+    allowed: boolean;
+    principal?: SearchPrincipal;
+    reason?: string;
+    status?: 401 | 403 | 503;
+  }>;
   isModuleAllowed(module: ModuleId, jurisdiction: string | undefined): boolean;
 }
 
