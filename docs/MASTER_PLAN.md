@@ -425,7 +425,7 @@ Phases 1–2 are built. `tsc` clean, `eslint` clean, 70/70 tests, `next build` g
 |---|---|---|
 | A1 Shell | ✅ | Glass primitives, `ConfidenceRing`, MapLibre dark canvas + 3D extrusion, Switzer self-hosted, Pittsburgh fixture page |
 | A2 Data | ✅ | 11 migrations, RLS on 15 tables, append-only enforced by triggers + grants, `halfvec` HNSW, region-pruned ANN function. **Not yet applied to any database** |
-| A3 Governance | 🟡 | In progress. `POST /api/search` returns 503 until its gates land |
+| A3 Governance | ✅ | Auth, verification, rate limits, audit, jurisdiction gating, corroboration enforcement, magic-link login. Cascade fully wired — `POST /api/search` now returns a typed 503 pointing at `.env.local` rather than a 500 |
 | B1 Inference | ✅ | Modal app, 4 models, warm container. **Not deployed** — no Modal account yet |
 | B2 Cascade | ✅ | Full orchestrator + verifiers + VERIFY module, 70 tests |
 | B3 Harvest | ✅ | Mapillary v4 client + tiling + index build. **No harvest run** — no token yet |
