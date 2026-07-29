@@ -417,6 +417,27 @@ This is a module, not an afterthought, because it's the moat.
 
 ## 11. Build plan
 
+### Status as of 2026-07-29
+
+Phases 1–2 are built. `tsc` clean, `eslint` clean, 70/70 tests, `next build` green. ~18,800 lines.
+
+| Agent | Status | Notes |
+|---|---|---|
+| A1 Shell | ✅ | Glass primitives, `ConfidenceRing`, MapLibre dark canvas + 3D extrusion, Switzer self-hosted, Pittsburgh fixture page |
+| A2 Data | ✅ | 11 migrations, RLS on 15 tables, append-only enforced by triggers + grants, `halfvec` HNSW, region-pruned ANN function. **Not yet applied to any database** |
+| A3 Governance | 🟡 | In progress. `POST /api/search` returns 503 until its gates land |
+| B1 Inference | ✅ | Modal app, 4 models, warm container. **Not deployed** — no Modal account yet |
+| B2 Cascade | ✅ | Full orchestrator + verifiers + VERIFY module, 70 tests |
+| B3 Harvest | ✅ | Mapillary v4 client + tiling + index build. **No harvest run** — no token yet |
+| C1 VEHICLE · C2 (VERIFY shipped in B2) · C3 CASE | ⬜ | Phase 3 |
+| D1 BENCH · D2 Demo | ⬜ | Phase 4 |
+
+**Three findings from the build worth carrying forward:**
+
+1. **Mapillary bbox search does not paginate.** Pagination is supported only in combination with `creator_username`, and `limit` caps at 2000. A tile returning exactly 2000 rows is *silently truncated* — no cursor, no error. Tiling a city naively produces an index quietly missing every dense downtown block while still returning plausible-looking neighbours. B3's harvester now treats `len(rows) == limit` as a subdivide signal and recurses. This would have been a very expensive bug to find later.
+2. **A2's HNSW index is on the bare column**, and `search_geo_candidates()` orders by `embedding <=> query`. An expression index over a cast (`(embedding::halfvec(512))`) is a *different* index that query can never use — B3 caught this before shipping a `DROP INDEX` that would have silently replaced a working index with an unusable one. Index builds now `REINDEX` so they cannot drift from the catalog definition.
+3. **`EIGENPLACES_INPUT_SIZE` is part of the descriptor's identity.** EigenPlaces applies no resize of its own, so the chosen input size is baked into what the vector means. Query and index must use the same value or recall degrades with no error surfacing anywhere. Changing it is a version bump plus a full index rebuild, never an in-place edit.
+
 ### Phase 0 — decisions (blocking, §12)
 
 ### Phase 1 — Foundation *(3 agents, parallel)*
@@ -444,14 +465,21 @@ Sequence Phase 1 → 2 → 3 → 4, but pipeline within each phase — B2 doesn'
 
 ## 12. Decisions I need from you
 
-**Blocking:**
+The four blocking decisions are answered — see **Locked decisions** at the top.
 
-1. **Metro #1 for the street index.** Determines the Mapillary harvest. Candidates given your context: Tulsa/Broken Arrow (Vantage groundwork), Pittsburgh (CMU), Stamford/Greenwich CT (home), or wherever the police conversations actually are.
-2. **First buyer.** Insurance SIU vs. PD pilot vs. prosumer self-serve. Changes the framing of the entire UI.
-3. **MATCH scope.** v1, v2, or never. Remember: mugshot galleries ⇒ CJIS ⇒ off this stack entirely.
-4. **v1 engine path.** Full cascade (cheap to run, ~3 weeks) vs. VLM-first shortcut (demoable in days, ~4× per-search cost, no street precision).
+**Accounts and keys needed to make what's built actually run** (nothing below is code work):
 
-**Non-blocking, need answers before launch:**
+| # | Need | Unblocks |
+|---|---|---|
+| 1 | **Supabase project** — then `supabase link` + `db push` | Everything. A2's 11 migrations have never touched a database |
+| 2 | **Mapillary API token** (free, instant) | B3's coverage pre-check, then the Pittsburgh harvest |
+| 3 | **Modal account** (free tier is enough to start) | B1's inference service; ~$5–12 one-time to embed the Pittsburgh index |
+| 4 | **Gemini API key** | Cascade stage 4. Degrades gracefully without it — the stage just skips |
+| 5 | *(later)* Hive or similar detector key | VERIFY's statistical layer. Provenance + metadata layers work without it |
+
+**Run the Mapillary coverage pre-check before committing to a harvest.** Community coverage is uneven and Pittsburgh city proper may be thin. It's ~40 requests, standalone, and exits non-zero on NO-GO. The staged fallback is city → inner ring → Allegheny County; note the full county at practical density is ~1.8M vectors, already near the ≤2M-per-metro ceiling.
+
+**Still open, before launch:**
 
 5. **Name.** "Lantage" is one letter from your own **Vantage** project — deliberate, or should these be clearly distinct? Also worth a trademark search; Raven/Graylark are in-market.
 6. **Which police departments, and what have you actually told them?** Determines jurisdiction gating and whether CCOPS applies.
