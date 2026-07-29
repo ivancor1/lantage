@@ -145,8 +145,10 @@ h4 {
     color-mix(in srgb, var(--color-n-0) 46%, transparent) 100%
   );
   box-shadow: var(--shadow-pill);
+  /* Authored unprefixed only — Lightning CSS adds prefixes from browserslist.
+     Hand-writing the -webkit- pair made it collapse the duplicate to the
+     prefixed form alone, which silently dropped blur in Firefox. */
   backdrop-filter: var(--glass-pill);
-  -webkit-backdrop-filter: var(--glass-pill);
   transform: translateZ(0);
 }
 
@@ -174,9 +176,7 @@ h4 {
     transparent 100%
   );
   backdrop-filter: var(--glass-scrim);
-  -webkit-backdrop-filter: var(--glass-scrim);
   mask-image: linear-gradient(to bottom, #000 0%, #000 46%, transparent 100%);
-  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 46%, transparent 100%);
   transform: translateZ(0);
   will-change: opacity;
   transition: opacity var(--d-scrim) ease;
@@ -189,7 +189,6 @@ h4 {
   /* MEASURED: flysoar drops blur on small screens. So do we. */
   .glass-pill {
     backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
   }
 }
 
@@ -198,7 +197,6 @@ h4 {
 .map-animating .glass-pill,
 .map-animating .glass-scrim {
   backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
 }
 
 /* ---- Eyebrow labels ----------------------------------------------------- */
@@ -293,4 +291,42 @@ h4 {
 }
 .maplibregl-ctrl-attrib a {
   color: var(--color-fg-secondary) !important;
+}
+
+/* ---- Self-hosted faces (appended by A1 — see src/lib/fonts.ts) ----------- */
+
+/* Switzer — Fontshare, free for commercial use. Downloaded from the Fontshare
+   CDN on 2026-07-29 into public/fonts. It is the closest free Swiss
+   neo-grotesque to flysoar.ai's licensed TWK Lausanne (DESIGN_SYSTEM.md §2);
+   Inter is the declared fallback in --font-sans. Not available through
+   next/font/google, hence the manual declarations. */
+@font-face {
+  font-family: 'Switzer';
+  src: url('/fonts/Switzer-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Switzer';
+  src: url('/fonts/Switzer-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Switzer';
+  src: url('/fonts/Switzer-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* next/font/google self-hosts JetBrains Mono under a hashed family name that is
+   only reachable via --font-jetbrains-mono. Rebind --font-mono to it so both the
+   Tailwind `font-mono` utility and `.eyebrow-mono` above resolve to the real
+   face instead of silently falling through to ui-monospace. */
+:root {
+  --font-mono:
+    var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
 }

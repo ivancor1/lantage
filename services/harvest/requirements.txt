@@ -1,0 +1,13 @@
+# Lantage harvest pipeline. Python 3.9+.
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r services/harvest/requirements.txt
+#
+# Deliberately small. Checkpointing uses stdlib sqlite3 so a resume never depends on
+# a service being up, and the Mapillary client is plain HTTP against the documented
+# v4 endpoints (see the module docstring in mapillary_api.py for why not the SDK).
+
+httpx>=0.27,<1.0
+
+# Only needed for `harvest.py load` and `embed_index.py --target postgres`.
+# Everything else runs without it.
+psycopg[binary]>=3.1,<4.0
