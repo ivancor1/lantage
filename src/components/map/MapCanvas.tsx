@@ -7,7 +7,6 @@ import {
   ScaleControl,
   addProtocol,
   type AddProtocolAction,
-  type ErrorEvent,
 } from 'maplibre-gl';
 import { Protocol } from 'pmtiles';
 import 'maplibre-gl/dist/maplibre-gl.css';
@@ -110,14 +109,25 @@ export function MapCanvas({
        then, if the configured archive is missing or unreadable we degrade to the
        keyless OpenFreeMap dark style rather than showing an empty black plane. */
     let fellBackToRaster = false;
-    const onError = (event: ErrorEvent) => {
+    /* maplibre-gl does not export its ErrorEvent class as a named type, so this is
+       declared structurally against the only field the handler reads. */
+    const onError = (event: { error?: { message?: string } }) => {
       const message = event.error?.message ?? '';
+      /* Surface every map error. A basemap that fails silently is the worst
+         failure mode this component has — see the container-height bug. */
+      console.error('[MapCanvas] map error:', message, event.error);
       if (!usingPmtiles || fellBackToRaster || !message.toLowerCase().includes('pmtiles')) return;
       fellBackToRaster = true;
       console.warn('[MapCanvas] PMTiles basemap unavailable; falling back to OpenFreeMap dark.', event.error);
       instance.setStyle(OPENFREEMAP_DARK_STYLE);
     };
     instance.on('error', onError);
+
+    /* Dev-only handle so the map can be inspected from the console. A black map
+       with no error is otherwise almost impossible to diagnose. */
+    if (process.env.NODE_ENV !== 'production') {
+      (window as unknown as { __lantageMap?: MapLibreMap }).__lantageMap = instance;
+    }
 
     setMap(instance);
 
@@ -134,9 +144,24 @@ export function MapCanvas({
   useMapAnimating(map);
 
   return (
-    /* --map-shell is true #000, reserved for exactly this surface. Everything
-       else in the app uses the blue-tinted off-blacks. */
-    <div ref={containerRef} className={className} style={{ background: 'var(--map-shell)' }}>
+    /* Two divs, deliberately.
+     *
+     * maplibre-gl.css sets `.maplibregl-map { position: relative }` on whatever
+     * element MapLibre is mounted into. Tailwind v4 emits its utilities inside a
+     * cascade layer, and unlayered CSS beats layered CSS regardless of source
+     * order — so MapLibre's `relative` always wins over an `absolute` utility on
+     * the same node. The container then has no positioned box and no content, and
+     * collapses to height 0: MapLibre initialises, reports a 0-size viewport,
+     * renders nothing and never requests a tile. Silently — no error anywhere.
+     *
+     * So the caller's positioning classes go on an outer div MapLibre never
+     * touches, and the mount node gets explicit 100% sizing, which MapLibre's
+     * stylesheet does not set and therefore cannot override.
+     *
+     * --map-shell is true #000, reserved for exactly this surface. Everything else
+     * in the app uses the blue-tinted off-blacks. */
+    <div className={className} style={{ background: 'var(--map-shell)' }}>
+      <div ref={containerRef} style={{ height: '100%', width: '100%' }} />
       {map && candidates?.length ? <ResultRings map={map} candidates={candidates} /> : null}
     </div>
   );
