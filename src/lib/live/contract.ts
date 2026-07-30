@@ -247,12 +247,46 @@ export interface ProvenanceHit {
 
 export type VisionVendor = 'anthropic' | 'openai' | 'gemini';
 
-/** Resolution order is deliberate: whichever key exists, in this priority. */
-export function resolveVisionVendor(env = process.env): VisionVendor | null {
-  if (env.ANTHROPIC_API_KEY) return 'anthropic';
-  if (env.OPENAI_API_KEY) return 'openai';
-  if (env.GEMINI_API_KEY || env.GOOGLE_API_KEY) return 'gemini';
-  return null;
+const VENDOR_KEY_ENV: Record<VisionVendor, readonly string[]> = {
+  anthropic: ['ANTHROPIC_API_KEY'],
+  openai: ['OPENAI_API_KEY'],
+  gemini: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
+};
+
+/**
+ * Deliberately looser than `NodeJS.ProcessEnv`, which requires `NODE_ENV` and so
+ * cannot be satisfied by a small object literal. `process.env` still assigns to
+ * this, and callers (including tests) can pass just the vars they care about.
+ */
+export type EnvLike = Readonly<Record<string, string | undefined>>;
+
+function hasKey(vendor: VisionVendor, env: EnvLike): boolean {
+  return VENDOR_KEY_ENV[vendor].some((name) => !!env[name]);
+}
+
+/**
+ * Which vision vendor to use.
+ *
+ * `LANTAGE_VISION_VENDOR` forces a specific one. Setting it and then not
+ * supplying that vendor's key returns null rather than silently falling through
+ * to a different vendor — a result attributed to the wrong model is worse than
+ * no result, because `ResultProvenance.models` is what makes a finding
+ * reproducible.
+ *
+ * With no override, the first vendor whose key is present wins, in this order.
+ */
+export function resolveVisionVendor(env: EnvLike = process.env): VisionVendor | null {
+  const forced = env.LANTAGE_VISION_VENDOR?.trim().toLowerCase();
+  if (forced) {
+    if (forced in VENDOR_KEY_ENV) {
+      const vendor = forced as VisionVendor;
+      return hasKey(vendor, env) ? vendor : null;
+    }
+    return null;
+  }
+
+  const order: readonly VisionVendor[] = ['anthropic', 'openai', 'gemini'];
+  return order.find((vendor) => hasKey(vendor, env)) ?? null;
 }
 
 export const VISION_GAP: CapabilityGap = {
