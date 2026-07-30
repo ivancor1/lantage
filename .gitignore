@@ -15,3 +15,10 @@ __pycache__/
 venv/
 data/harvest/
 *.tsbuildinfo
+
+# Locally cached ONNX face-recognition weights (fetched from opencv_zoo, ~39MB)
+.lantage-models/
+.lantage-uploads/
+research/
+.lantage-uploads/
+.lantage-models/
