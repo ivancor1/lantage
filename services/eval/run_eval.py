@@ -140,6 +140,59 @@ class Index:
 # ---------------------------------------------------------------------------
 
 
+def assert_is_our_embedder(embed_url: str) -> Dict[str, Any]:
+    """Refuse to embed against whatever happens to answer on that port.
+
+    A retrieval benchmark that silently embedded against the wrong service would
+    report a number, not an error -- the exact failure mode this project exists to
+    eliminate. Ports in the 8000s are contested (an Xcode-bundled Python was found
+    holding 8000 on the development machine), and a foreign JSON responder would
+    otherwise surface only as unexplained bad recall.
+
+    So the identity of the service, the model name and the descriptor width are all
+    checked before a single image is sent. A dimension mismatch is the dangerous
+    one: cosine across two descriptor spaces returns plausible nonsense rather
+    than raising.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"{embed_url.rstrip('/')}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            health = json.loads(r.read())
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise SystemExit(
+            f"no embedding service at {embed_url} ({e}). Start it:\n"
+            "  TORCH_HOME=$PWD/.lantage-models/torch \\\n"
+            "    services/inference/.venv/bin/python services/inference/local_server.py"
+            " --port 8010"
+        )
+
+    if health.get("service") != "lantage-inference-local":
+        raise SystemExit(
+            f"{embed_url} answered /health, but it is not our embedding service "
+            f"(service={health.get('service')!r}). Something else is holding that "
+            "port; embedding against it would produce a plausible-looking wrong "
+            "number rather than an error."
+        )
+
+    model = (health.get("models") or {}).get("eigenplaces") or {}
+    dim = model.get("dim")
+    if dim != 512:
+        raise SystemExit(
+            f"{embed_url} serves a {dim}-d eigenplaces descriptor; the indexes in "
+            "this project are 512-d. Cosine across two descriptor spaces returns "
+            "nonsense silently, so this is refused."
+        )
+    print(
+        f"[embed] {health['service']} {model.get('version')} "
+        f"dim={dim} device={health.get('device')}",
+        file=sys.stderr,
+    )
+    return health
+
+
 def embed_queries(
     queries: Sequence[Dict[str, Any]],
     embed_url: str,
@@ -154,6 +207,8 @@ def embed_queries(
     """
     import urllib.error
     import urllib.request
+
+    assert_is_our_embedder(embed_url)
 
     cache: Dict[str, List[float]] = {}
     if cache_path and cache_path.exists():
@@ -420,7 +475,12 @@ def main() -> None:
     p.add_argument("--db", required=True)
     p.add_argument("--queries", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--embed-url", default="http://localhost:8000")
+    # 8010, matching LANTAGE_LOCAL_EMBED_URL in .env.local, so the harness and the
+    # app speak to one service. 8000 was the old default and is a bad one: it is a
+    # popular port (an Xcode-bundled Python was found squatting on it on this
+    # machine), and until the health check below existed, a foreign responder there
+    # would have been embedded against silently.
+    p.add_argument("--embed-url", default="http://127.0.0.1:8010")
     p.add_argument("--embed-cache", default="data/eval/embed_cache.json")
     p.add_argument(
         "--drop-panos",
