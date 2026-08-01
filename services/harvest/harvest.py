@@ -1196,15 +1196,23 @@ async def precheck(
     raw_total = 0
     pano_total = 0
     truncated_tiles = 0
+    dense_tiles = 0
+    dense_subdivisions = 0
+    failed_tiles = 0
 
     emit("precheck_start", metro=metro.slug, sampled_tiles=len(tiles), total_tiles=total_tiles)
 
     for i, tile in enumerate(tiles, 1):
         try:
-            rows, truncated = await client.search_images(tile, fields=IMAGE_FIELDS)
+            rows, truncated, splits = await sample_tile_rows(client, tile)
         except MapillaryError as exc:
+            failed_tiles += 1
             emit("precheck_tile_failed", tile=tile.to_param(), status=exc.status, error=str(exc))
             continue
+        if splits:
+            dense_tiles += 1
+            dense_subdivisions += splits
+            emit("precheck_tile_too_dense", tile=tile.to_param(), subdivisions=splits, rows=len(rows))
         raw_total += len(rows)
         if truncated:
             truncated_tiles += 1
@@ -1235,6 +1243,7 @@ async def precheck(
                 "raw": len(rows),
                 "kept": kept_here,
                 "truncated": truncated,
+                "dense_subdivisions": splits,
             }
         )
         if i % 10 == 0:
@@ -1262,6 +1271,19 @@ async def precheck(
                 median_year = int(y)
                 break
 
+    # THE VERDICT IS SCOPE-AWARE, AND THAT IS THE WHOLE POINT.
+    #
+    # It judges density achieved against the §3 target for THIS bbox's own street
+    # length. An absolute floor cannot do that job: a 100k threshold is a statement
+    # about metro-sized areas, and applied to a deliberately small box it fails a
+    # perfectly-covered downtown for the crime of being small. Downtown Greenwich
+    # projected 1,048 indexable against its own target of 12,800 and was told to
+    # "widen to Allegheny County" — a different state, and not the problem.
+    # The absolute count still matters for the vector budget, so it is reported —
+    # as context, never as the verdict.
+    attainment = (projected_kept / float(sizing_target)) if sizing_target else 0.0
+    has_imagery = raw_total > 0 and coverage_fraction > 0.0
+
     warnings: List[str] = []
     if truncated_tiles:
         warnings.append(
@@ -1269,10 +1291,24 @@ async def precheck(
             "The real harvest subdivides these; projected_raw is understated."
             % (truncated_tiles, n)
         )
+    if dense_tiles:
+        warnings.append(
+            "%d/%d sampled tiles were refused by the API as too data-dense and were "
+            "measured by subdividing (%d extra requests). This is normal in a dense "
+            "centre and the harvest handles it the same way — see docs/HARVEST.md §2."
+            % (dense_tiles, n, dense_subdivisions)
+        )
+    if failed_tiles:
+        warnings.append(
+            "%d sampled tiles failed outright and are excluded from the projection, "
+            "which is therefore measured over %d tiles, not %d." % (failed_tiles, n, len(tiles))
+        )
     if coverage_fraction < 0.5:
         warnings.append(
             "only %.0f%% of sampled tiles contain any imagery — coverage is patchy. "
-            "Expect holes in the index and consider widening the bbox." % (coverage_fraction * 100)
+            "Expect holes in the index. Check whether the empty tiles are water or "
+            "parkland (geography, not a coverage problem) before widening."
+            % (coverage_fraction * 100)
         )
     if median_year is not None and median_year < 2019:
         warnings.append(
@@ -1280,29 +1316,57 @@ async def precheck(
             "change; consider start_captured_at to bias newer, at the cost of coverage."
             % median_year
         )
-    if projected_kept < 100_000:
+    if attainment < ATTAINMENT_USABLE:
+        wider = wider_metro_suggestion(metro)
+        fallback = (
+            "widen to %s (--metro %s), staged, re-checking the vector budget at each step"
+            % (wider.name, wider.slug)
+            if wider
+            else "no registered metro contains this bbox — widen manually with --bbox, or "
+            "accept that Mapillary contributors have not driven this area"
+        )
         warnings.append(
-            "projected %d indexable images is below the ~100k floor for a usable metro "
-            "index. FALLBACK: widen to Allegheny County (--metro allegheny), staged "
-            "city -> inner ring -> county." % projected_kept
+            "measured coverage is %.0f%% of what this bbox's own %s km of street could "
+            "support at the §3 practical density (%s of %s images). Widening buys more "
+            "thin area, not more coverage — but if the goal is a bigger index: %s."
+            % (
+                attainment * 100,
+                f"{metro.street_km:,}",
+                f"{projected_kept:,}",
+                f"{sizing_target:,}",
+                fallback,
+            )
+        )
+    if projected_kept < METRO_SCALE_IMAGES:
+        warnings.append(
+            "CONTEXT, NOT A VERDICT: %s projected indexable images is below the ~%s that "
+            "makes a metro-scale index. For a small bbox that is arithmetic, not a "
+            "coverage problem — the verdict above is judged on density, not size."
+            % (f"{projected_kept:,}", f"{METRO_SCALE_IMAGES:,}")
         )
 
-    if projected_kept >= 100_000 and coverage_fraction >= 0.5:
+    if not has_imagery:
+        verdict = "NO-GO — no imagery found in this bbox"
+    elif attainment >= ATTAINMENT_HEALTHY and coverage_fraction >= 0.5:
         verdict = "GO"
-    elif projected_kept >= 50_000:
+    elif attainment >= ATTAINMENT_USABLE:
         verdict = "GO-WITH-CAVEATS"
     else:
-        verdict = "NO-GO — widen the bbox"
+        verdict = "NO-GO — too sparse to match against"
 
     report = {
         "metro": metro.name,
         "bbox": metro.bbox.to_param(),
         "verdict": verdict,
+        "target_attainment": round(attainment, 3),
         "sampled_tiles": n,
         "total_tiles": total_tiles,
         "tiles_with_imagery": len(nonempty),
         "coverage_fraction": round(coverage_fraction, 3),
         "truncated_tiles": truncated_tiles,
+        "too_dense_tiles": dense_tiles,
+        "dense_subdivisions": dense_subdivisions,
+        "failed_tiles": failed_tiles,
         "raw_images_sampled": raw_total,
         "mean_raw_per_tile": round(mean_raw, 1),
         "mean_kept_per_tile": round(mean_kept, 1),
@@ -1318,7 +1382,13 @@ async def precheck(
         "api_requests": client.stats.requests,
         "per_tile": per_tile,
     }
-    emit("precheck_done", verdict=verdict, projected_indexable_images=projected_kept)
+    emit(
+        "precheck_done",
+        verdict=verdict,
+        target_attainment=round(attainment, 3),
+        projected_indexable_images=projected_kept,
+        sizing_table_target=sizing_target,
+    )
     return report
 
 
@@ -1335,6 +1405,10 @@ def print_precheck(report: Dict[str, Any]) -> None:
     )
     w("raw images in sample     %d (mean %.1f/tile)\n" % (report["raw_images_sampled"], report["mean_raw_per_tile"]))
     w("cap-truncated tiles      %d\n" % report["truncated_tiles"])
+    w(
+        "too-dense tiles          %d (measured by subdividing, %d extra requests)\n"
+        % (report.get("too_dense_tiles", 0), report.get("dense_subdivisions", 0))
+    )
     w("thinning keeps           %s of raw\n" % _pct(report["thinning_ratio"]))
     w("panorama share           %s\n" % _pct(report["pano_share"]))
     w("median capture year      %s\n" % report["median_capture_year"])
@@ -1342,6 +1416,24 @@ def print_precheck(report: Dict[str, Any]) -> None:
     w("  raw images             %s\n" % f"{report['projected_raw_images']:,}")
     w("  indexable after thin   %s\n" % f"{report['projected_indexable_images']:,}")
     w("  sizing-table target    %s  (street_km x 200/km, MASTER_PLAN §3)\n" % f"{report['sizing_table_target']:,}")
+    # The ratio is the verdict input; the count above it is context. Printed adjacent
+    # so nobody has to divide two numbers to know which one the verdict used.
+    w(
+        "  TARGET ATTAINMENT      %.0f%%  <- the verdict is judged on THIS, not on the\n"
+        "                               absolute count (GO >= %.0f%%, NO-GO < %.0f%%)\n"
+        % (
+            report["target_attainment"] * 100,
+            ATTAINMENT_HEALTHY * 100,
+            ATTAINMENT_USABLE * 100,
+        )
+    )
+    w(
+        "  scale, for context     %s of a metro-scale index (~%s images)\n"
+        % (
+            _pct(report["projected_indexable_images"] / float(METRO_SCALE_IMAGES)),
+            f"{METRO_SCALE_IMAGES:,}",
+        )
+    )
     if report["discards_in_sample"]:
         w("\ndiscards in sample\n")
         for k, v in report["discards_in_sample"].items():
@@ -1620,23 +1712,45 @@ def cmd_load(
 
 
 def resolve_metro(args: argparse.Namespace) -> Metro:
+    measured_km = getattr(args, "street_km", None)
     if getattr(args, "bbox", None):
         bbox = Bbox.parse(args.bbox)
         # Rough street-km guess from area so `precheck` can still cross-check against
         # the sizing table for an ad-hoc box: dense US urban ≈ 11 km of street per km².
+        # It is only ever a guess, and both the verdict and the density line are now
+        # judged against it — so `--street-km` exists to replace it with the Overpass
+        # measurement (`metros.py --overpass <slug>` prints the query shape). Measured
+        # downtown Greenwich is 13.2 km/km², so the default understates a village
+        # centre by ~20%.
         area = bbox.width * 111.32 * math.cos(math.radians(bbox.center[1])) * bbox.height * 111.32
         return Metro(
             slug=getattr(args, "slug", None) or "adhoc",
             name="ad-hoc bbox %s" % bbox.to_param(),
             bbox=bbox,
-            street_km=max(1, int(area * 11)),
+            street_km=int(measured_km) if measured_km else max(1, int(area * 11)),
             area_km2=max(1, int(area)),
-            note="ad-hoc; street_km is estimated from area at 11 km/km^2",
+            note=(
+                "ad-hoc; street_km measured (--street-km)"
+                if measured_km
+                else "ad-hoc; street_km is estimated from area at 11 km/km^2"
+            ),
         )
     slug = args.metro
     if slug not in METROS:
         raise SystemExit("unknown metro %r. Known: %s" % (slug, ", ".join(sorted(METROS))))
-    return METROS[slug]
+    metro = METROS[slug]
+    if measured_km:
+        # Reporting only — street_km is not in the params fingerprint, so this never
+        # invalidates a checkpoint and never changes what gets harvested.
+        return Metro(
+            slug=metro.slug,
+            name=metro.name,
+            bbox=metro.bbox,
+            street_km=int(measured_km),
+            area_km2=metro.area_km2,
+            note=metro.note + " [street_km overridden via --street-km]",
+        )
+    return metro
 
 
 def params_from_args(args: argparse.Namespace) -> HarvestParams:
@@ -1678,6 +1792,13 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="heading buckets per cell; 4 => the 200 images/km practical row in MASTER_PLAN §3",
     )
     p.add_argument("--include-panos", action="store_true", dest="include_panos")
+    p.add_argument(
+        "--street-km", type=float, default=None, dest="street_km",
+        help="measured drivable centreline km inside the bbox, replacing the 11 km/km^2 "
+             "estimate used for an ad-hoc --bbox. The verdict and the density line are "
+             "both judged against it, so measure it: metros.py --overpass <slug> prints "
+             "the Overpass query. Reporting only — never changes what is harvested.",
+    )
     p.add_argument("--rate-fraction", type=float, default=0.25, dest="rate_fraction",
                    help="fraction of the documented Mapillary rate ceiling to spend")
 

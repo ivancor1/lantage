@@ -89,6 +89,7 @@ import type {
   RefineResult,
   RefineSignageClue,
 } from './contract';
+import { defaultLocalEmbedClient, defaultLocalVectorSearch } from './localIndex';
 import { readUpload } from './uploads';
 
 export type { RefineResult } from './contract';
@@ -142,9 +143,9 @@ const EMBED_GAP: CapabilityGap = {
   capability: 'Place-recognition descriptors',
   impact:
     'The frame could not be turned into an EigenPlaces-512 descriptor, so it could not be matched against the street index. Without a match there is no `vpr-match`, and without one nothing may claim street precision.',
-  envVar: 'MODAL_EMBED_URL',
+  envVar: 'MODAL_EMBED_URL, or LANTAGE_LOCAL_EMBED_URL',
   howTo:
-    'Deploy services/inference/app.py to Modal and set MODAL_EMBED_URL (plus MODAL_EMBED_TOKEN if the endpoint is protected).',
+    'Deploy services/inference/app.py to Modal and set MODAL_EMBED_URL (plus MODAL_EMBED_TOKEN if the endpoint is protected). With no cloud account: run `services/inference/.venv/bin/python services/inference/local_server.py`, which serves the same contract on CPU/MPS, and set LANTAGE_LOCAL_EMBED_URL=http://localhost:8000 (implied when LANTAGE_LOCAL_INDEX is set). See docs/HARVEST.md §14.',
 };
 
 const GEOCODER_GAP: CapabilityGap = {
@@ -375,6 +376,23 @@ async function run(input: RefineInput, deps: RefineDeps): Promise<RefineResult> 
   }
   models.vpr = descriptor?.version ? `eigenplaces-512@${descriptor.version}` : 'eigenplaces-512';
 
+  /**
+   * Charge GPU time only when a billed service actually ran it.
+   *
+   * `modalCostUsd()` converts elapsed milliseconds into Modal's L4 per-second
+   * rate. On the local path the model runs on this machine and nothing is
+   * billed, so applying that rate invents a charge that was never incurred —
+   * fabricated data by this repo's own rule, even though the number is tiny.
+   *
+   * The version string is the discriminator because it is already the
+   * provenance mechanism everywhere else: the local server reports
+   * `eigenplaces-r50-512-local@…` precisely so a local result is never
+   * mistaken for a Modal one. Unknown provenance charges nothing — an
+   * understated cost is a reporting gap, an overstated one is a false claim.
+   */
+  const embedRanLocally = (descriptor?.version ?? '').includes('local');
+  const embedCostUsd = embedRanLocally ? 0 : modalCostUsd(embedded.value.tookMs || 0);
+
   const found = await search.searchGeoCandidates({
     embedding: vector,
     bbox,
@@ -387,7 +405,7 @@ async function run(input: RefineInput, deps: RefineDeps): Promise<RefineResult> 
     stages.push({
       stage: 'vpr-retrieval',
       ranMs: retrievalMs,
-      costUsd: modalCostUsd(embedded.value.tookMs || retrievalMs),
+      costUsd: embedCostUsd,
       skipped: { reason: found.error.reason },
     });
     return { ...emptyResult(input, bbox, coverage, quality), stages, unavailable };
@@ -401,7 +419,7 @@ async function run(input: RefineInput, deps: RefineDeps): Promise<RefineResult> 
   stages.push({
     stage: 'vpr-retrieval',
     ranMs: retrievalMs,
-    costUsd: modalCostUsd(embedded.value.tookMs || retrievalMs) + COSTS.vectorSearchUsdPerCall,
+    costUsd: embedCostUsd + COSTS.vectorSearchUsdPerCall,
     ...(hits.length === 0
       ? {
           skipped: {
@@ -664,6 +682,19 @@ export function finaliseStreetCandidates(
       rejected.push(c.id);
       continue;
     }
+    // ...and it is not enough that the evidence *could* earn street precision.
+    //
+    // Every refine candidate carries a vpr-match by construction, so the check
+    // above always passes and on its own it drops nothing. A candidate whose top
+    // similarity fell below `streetPrecisionMinSimilarity` was assigned
+    // `precisionForRadius(...)` upstream and arrives here labelled 'city' — which
+    // is precisely the confusion this module exists to prevent. The operator
+    // already had a region before they pressed refine; a region-shaped answer
+    // sitting at rank 2 of a street result reads as a street answer.
+    if (c.precision !== 'street') {
+      rejected.push(c.id);
+      continue;
+    }
 
     const signals = independentSignalCount(c.evidence);
     const confidence = calibrate({
@@ -756,9 +787,20 @@ async function defaultReadFrame(uploadId: string): Promise<StoredFrame | null> {
   return found ? { bytes: found.bytes, mime: found.mime } : null;
 }
 
+/**
+ * Modal first, the local CPU/MPS server second, null when neither is wired.
+ *
+ * Order matters for provenance rather than for speed: both speak the same
+ * contract, but they return different `version` strings, and the deployed GPU
+ * service is the one whose descriptors match a shared Postgres index. Falling
+ * back only when Modal is absent means a local result can never quietly
+ * substitute for one the team's index was built with.
+ */
 function defaultEmbedClient(env: EnvLike): EmbedClient | null {
-  if (!env.MODAL_EMBED_URL) return null;
-  return new ModalEmbedClient(env.MODAL_EMBED_URL, env.MODAL_EMBED_TOKEN);
+  if (env.MODAL_EMBED_URL) {
+    return new ModalEmbedClient(env.MODAL_EMBED_URL, env.MODAL_EMBED_TOKEN);
+  }
+  return defaultLocalEmbedClient(env);
 }
 
 function defaultGeocoder(env: EnvLike): Geocoder | null {
@@ -777,7 +819,14 @@ function defaultGeocoder(env: EnvLike): Geocoder | null {
  */
 export function defaultVectorSearch(env: EnvLike = process.env): GeoVectorSearch | null {
   const endpoint = resolveIndexEndpoint(env);
-  if (!endpoint) return null;
+  if (!endpoint) {
+    // No Postgres: fall back to the local SQLite index if one is configured.
+    // Exact brute-force cosine with the bbox applied before scoring — the same
+    // ordering the SQL function guarantees, and at 1.6k rows the same answer
+    // with zero recall loss. Returns null when LANTAGE_LOCAL_INDEX is unset, so
+    // the unconfigured path is unchanged.
+    return defaultLocalVectorSearch(env);
+  }
 
   return {
     async searchGeoCandidates({ embedding, bbox, limit, signal }) {

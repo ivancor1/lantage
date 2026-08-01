@@ -71,15 +71,78 @@ Read three things:
 
 Exit code is 0 on `GO` / `GO-WITH-CAVEATS`, 2 on `NO-GO`, so it gates a scripted run.
 
-### Verdict thresholds
+### Verdict thresholds — a ratio, not a count
 
-| Projected indexable | Coverage fraction | Verdict | Action |
+**The verdict is scope-aware.** It is judged on `target_attainment`, the fraction of
+what *this bbox's own street length* could support at the §3 practical density that
+Mapillary actually has:
+
+```
+target_attainment = projected_indexable_images / (street_km × 50 × heading_sectors)
+```
+
+| `target_attainment` | Coverage fraction | Verdict | Action |
 |---|---|---|---|
-| ≥ 100k | ≥ 50% | `GO` | proceed |
-| ≥ 50k | any | `GO-WITH-CAVEATS` | proceed, but expect holes; document them for BENCH |
-| < 50k | any | `NO-GO` | widen the bbox — see below |
+| ≥ 0.75 | ≥ 50% | `GO` | proceed |
+| ≥ 0.75 | < 50% | `GO-WITH-CAVEATS` | proceed; the covered part is dense but there are holes |
+| ≥ 0.40 | any | `GO-WITH-CAVEATS` | proceed, but expect holes; document them for BENCH |
+| < 0.40 | any | `NO-GO — too sparse to match against` | see below |
+| no imagery at all | 0 | `NO-GO — no imagery found in this bbox` | wrong box, or genuinely undriven |
 
-### Fallback: widen to Allegheny County
+It used to be an absolute floor: `≥100k` projected images to pass, `<50k` to fail.
+That is a statement about *metro-sized* areas, and it fires nonsensically on any
+deliberately small bbox. Downtown Greenwich projected 1,048 indexable images against
+its own sizing target of 12,800 — 8% attainment, a real coverage finding — and the
+tool reported it as "NO-GO — widen the bbox" **because 1,048 < 100,000**, then advised
+widening to Allegheny County, which is in a different state. A small dense area can now
+pass on its own terms, and a genuinely thin one still fails.
+
+The absolute count has not gone away, because it still governs the vector budget
+(MASTER_PLAN §3) and whether this deserves to be called a metro index. It is printed
+as **context, explicitly labelled as not the verdict**:
+
+```
+  indexable after thin   1,540
+  sizing-table target    15,400  (street_km x 200/km, MASTER_PLAN §3)
+  TARGET ATTAINMENT      10%  <- the verdict is judged on THIS, not on the
+                               absolute count (GO >= 75%, NO-GO < 40%)
+  scale, for context     1.5% of a metro-scale index (~100,000 images)
+```
+
+The bands are the same 0.75 / 0.40 that `scripts/harvest/greenwich.sh` prints and that
+§12.5 documents, so there is now **one** interpretation rather than a tool-level
+absolute verdict and a script-level ratio that disagree with each other. The script's
+`FORCE=1` override still works, but it should no longer be needed to get past a scale
+mismatch — that was the bug, and it is fixed at the source.
+
+#### `street_km` has to be real, or the ratio is not
+
+The denominator is the bbox's drivable centreline kilometres. For a registered metro it
+is measured from OSM and stored in `metros.py`. For an ad-hoc `--bbox` it is **estimated
+from area at 11 km/km²**, which is only a guess — measured downtown Greenwich is
+13.2 km/km², so the default understates a village centre by about 20% and flatters the
+ratio by the same amount. Pass `--street-km` with the measured figure whenever the
+verdict matters:
+
+```bash
+# metros.py --overpass <slug> prints the query shape; edit the bbox line
+python3 services/harvest/metros.py --overpass greenwich
+```
+
+`--street-km` is reporting only. It is not in the checkpoint fingerprint and it never
+changes what gets harvested.
+
+### Fallback when the verdict is genuinely NO-GO
+
+The suggested widening is now **derived from the metro registry** — the smallest
+registered metro whose bbox strictly contains the one you searched — instead of the
+hardcoded "widen to Allegheny County", which was wrong advice for every search that
+was not Pittsburgh. Pittsburgh still suggests Allegheny; downtown Greenwich suggests
+`greenwich-pilot`; a bbox no registered metro contains is told so plainly rather than
+being pointed at an unrelated county.
+
+Note what widening does and does not buy: if attainment is low, more area is more
+*thin* area. Widening raises the absolute row count and leaves the density unchanged.
 
 City-proper Pittsburgh is only 151 km². If it comes back thin:
 
@@ -136,7 +199,7 @@ Imagery access itself is **$0**. There is no paid tier to reach and no quota to 
 
 ---
 
-## 2. The verified API shape, and the one trap in it
+## 2. The verified API shape, and the two traps in it
 
 Verified against <https://www.mapillary.com/developer/api-documentation> on
 **2026-07-29**. Re-verify before changing any of this; field names have moved across
@@ -160,7 +223,7 @@ Fields requested: `id`, `geometry`, `computed_geometry`, `compass_angle`,
 `computed_compass_angle`, `captured_at`, `thumb_1024_url`, `sequence`, `is_pano`,
 `camera_type`, `quality_score`.
 
-### The trap: bbox search does not paginate
+### The first trap: bbox search does not paginate
 
 > "Pagination is currently supported only in combination with **creator_username**
 > parameter."
@@ -176,6 +239,93 @@ tile into quadrants and re-query, recursively, to a depth of 6. Tiles that still
 the cap at depth 6 (~15 m across) emit a `tile_truncated_at_max_depth` event at
 severity `error`, because at that point either the API changed or something is wrong,
 and coverage there is genuinely incomplete.
+
+### The second trap: a dense bbox is refused outright, with a 500
+
+Truncation is not the only way a dense area breaks a naive walk, and the other way is
+worse because it looks like an outage. A bbox holding enough imagery is **rejected**:
+
+```
+HTTP 500
+{"error":{"code":1,"message":"Please reduce the amount of data you're asking for,
+ then retry your request"}}
+```
+
+Measured against downtown Greenwich CT on **2026-07-31** with a valid token:
+
+| Request | Result |
+|---|---|
+| bbox `-73.6310,41.0150,-73.6220,41.0240` (one 0.009° tile), `limit=50` | **HTTP 500** |
+| the same bbox, `limit=2000` | **HTTP 500** |
+| that tile's south-west quadrant (0.0045°), `limit=2000` | HTTP 200, 1,938 rows |
+| bbox `-73.6280,41.0180,-73.6260,41.0200` (0.002°), `limit=50` | HTTP 200, 46 rows |
+
+**The refusal tracks the volume of data inside the bbox, not `limit`.** Lowering `limit`
+does not help — the message is about the box, not the page size. Three consequences:
+
+1. **It is not retryable.** The same request has the same outcome forever. Treating it
+   as a generic 5xx means backing off 1 s → 2 s → 5 s → 10 s → 21 s and then giving up
+   having collected nothing. That is what the harvester did before 2026-07-31, and a
+   `run` over downtown Greenwich completed **zero** tiles because of it.
+2. **It is a subdivide signal**, the same remedy as truncation reached from the opposite
+   direction: truncation subdivides *holding 2000 rows*, density subdivides *holding
+   none*. `mapillary_api.AreaTooDense` is the distinct typed condition, raised from the
+   first response with no retry spent, and `walk_tile` splits on it exactly as it splits
+   on the row cap.
+3. **It hits the blocks you most want.** These are dense downtown tiles — the ones with
+   the most imagery, the freshest imagery, and the most matchable streetscape. Losing
+   them silently is the worst possible failure shape for this index. In the measured
+   Greenwich run, **37% of the final index came from the two bboxes the old code could
+   not read at all.**
+
+This is not a Greenwich problem. Any dense city centre will do it, Pittsburgh's
+included, so the §4 Pittsburgh runbook was affected too.
+
+The classification deliberately matches on **the message text and the 5xx together**,
+never the status alone (`is_area_too_dense` in `mapillary_api.py`). A genuine 500 must
+keep its retries; only this specific refusal skips them.
+
+**The fix is adaptive, not a smaller default tile.** Dropping `--tile-deg` globally
+would multiply the request count over the whole metro to solve a problem that exists in
+a handful of tiles — density varies enormously *within* one metro. Downtown Greenwich
+needed depth 1 (0.0045°); the other 7 root tiles in the same box needed depth 0.
+
+What you will see, and where:
+
+| Event | Severity | Meaning |
+|---|---|---|
+| `tile_too_dense` | info | API refused this bbox; splitting into quadrants. Normal in a centre |
+| `tile_too_dense_at_max_depth` | **error** | ~15 m box still refused. **Nothing was collected here.** Recorded in `coverage_gaps` |
+| `tile_truncated_at_max_depth` | **error** | ~15 m box still at the 2000-row cap. Also recorded as a gap |
+| `coverage_incomplete` | **error** | emitted once at the end of a run that has any gaps |
+
+Subdivisions are recorded in the checkpoint (`tiles.split_reason` is `area_too_dense`
+or `row_cap`), so a resume never re-issues a request already known to be refused, and
+`harvest.py stats` reports the two reasons separately:
+
+```
+  tiles subdivided       2 for density, 0 for the 2000-row cap (max depth 1)
+  coverage gaps          none — every tile enumerated to completion
+```
+
+**Gaps are durable, not just logged.** A box abandoned at max depth is written to the
+`coverage_gaps` table and printed by `stats` on every subsequent invocation, because a
+run that under-collects must not be able to look complete afterwards. A plain resume
+will *not* revisit them — their parents legitimately finished, so the early-out prunes
+the subtree — so retry them explicitly:
+
+```bash
+python3 services/harvest/harvest.py run --metro <slug> --retry-gaps
+```
+
+That re-walks only the recorded boxes and clears each one that enumerates cleanly.
+
+`precheck` subdivides on this too. It has to: if a sampled tile that returns HTTP 500
+were dropped as a failure, the sample would silently exclude the *densest* tiles in the
+metro, and the projection built from it would understate coverage worst exactly where
+coverage is best. That was measurable — the first downtown Greenwich pre-check scored
+7 of 9 tiles and 8,608 raw images; the same box with density subdivision scores **9 of
+9 and 19,009**.
 
 ### Tile sizing
 
@@ -264,10 +414,20 @@ documented ceiling (`--rate-fraction`), so a retry storm cannot exhaust the app 
 for anything else using the same token. Rate limits are not the binding constraint here
 — a full Pittsburgh harvest is ~1,000–1,400 requests against a 2,500/min budget.
 
+The `progress` line also carries `split_for_density`, `split_for_row_cap` and
+`coverage_gaps` — the two subdivision reasons from §2 and the count of boxes that could
+not be enumerated. `coverage_gaps` should be 0; if it is not, the run is under-collecting
+and `stats` will keep saying so afterwards.
+
 Retries: 429 honours `Retry-After`, otherwise exponential backoff with full jitter (the
 jitter matters — without it all 8 workers trip the limiter on the same tick and
 retry in lockstep). 5xx and transport errors retry the same way. A tile that fails all
 attempts is left **unmarked**, so the next run retries exactly that box.
+
+**The one 5xx that is not retried** is the dense-bbox refusal in §2 — retrying it is
+guaranteed to fail, so it raises `AreaTooDense` on the first response and the tile is
+subdivided instead. It costs zero backoff: the measured downtown Greenwich run hit it
+twice and recorded `api_retries: 0`.
 
 ### Resuming
 
@@ -278,9 +438,15 @@ tile — a `kill -9` loses at most one tile).
 - Completed tiles are skipped; a partially-descended subtree re-descends and skips its
   finished children.
 - Every id ever considered is in `seen`, so a re-read cannot duplicate or re-rank.
+- Tiles subdivided because the API refused them as too dense are recorded like any
+  other completed parent, so a resume never re-issues a request already known to fail.
 - **Changing `--cell-meters`, `--heading-sectors`, `--include-panos`, `--tile-deg`, or
   the bbox refuses to resume.** Bucket keys derive from those, so resuming would blend
   two different grids into one index. Use a fresh `--db`, or `--reset` to start over.
+  (`--street-km` is reporting only and is *not* part of that fingerprint.)
+- **`--retry-gaps` is separate from resuming.** Boxes abandoned at max subdivide depth
+  sit under parents that legitimately completed, so a plain resume prunes past them.
+  `run --retry-gaps` re-walks only those recorded boxes.
 
 ---
 
@@ -509,15 +675,22 @@ python3 services/harvest/harvest.py stats --metro pittsburgh
 ```
 Pittsburgh, PA (city) — harvest state
   leaf tiles complete    537 (root grid 416)
+  tiles subdivided       12 for density, 41 for the 2000-row cap (max depth 3)
   indexable records      318,442
     with SfM geometry    301,118 (94.6%)
   embedded               318,442 (100.0%)
   density                199 images/km of street (practical target 200)
   distinct grid cells    88,301 (mean 3.61 headings/cell)
+  coverage gaps          none — every tile enumerated to completion
 ```
 
-The two numbers that matter are the last two, not the row count. **A row count can be
-large and still describe four dense corridors.**
+(Pittsburgh figures illustrative; the only measured `stats` output in this document is
+downtown Greenwich's, in §12.9.)
+
+The two density numbers matter more than the row count. **A row count can be large and
+still describe four dense corridors.** Read `coverage gaps` first, though: anything
+other than `none` means the row count below it describes only the part of the box that
+answered, and the missing boxes are listed underneath with a `--retry-gaps` command.
 
 - `density` against the 200 images/km target says whether you hit the sizing model.
 - `mean headings/cell` near 4.0 says coverage is *even*. Well under 2.0 with a healthy
@@ -526,6 +699,9 @@ large and still describe four dense corridors.**
   BENCH (§10).
 - `leaf tiles complete` exceeding the root grid count is expected and healthy: it is the
   subdivision working.
+- `tiles subdivided … for density` is the §2 refusal. Non-zero is normal for any dense
+  centre and means those tiles were collected, not lost. Zero on a metro with a real
+  downtown is worth a second look — it may mean the walk never got that far.
 
 In SQL, after loading:
 
@@ -750,8 +926,11 @@ but this pipeline does not touch `www.mapillary.com` (Terms §5, and see the
 page's JavaScript is somebody else's credential, not ours.
 
 So: **Fairfield County is dense suburban Northeast and probably has good contributor
-coverage — and "probably" is not a number.** Nothing in this repo asserts Greenwich
-coverage. The pre-check is one command and it is the first thing the script runs:
+coverage — and "probably" is not a number.** That was written before a token existed.
+It is now measured for one box: **§12.9 has real harvested numbers for downtown
+Greenwich**, and they are not what the model predicted. Everything at town scale and
+above is still projection. The pre-check is one command and it is the first thing the
+script runs:
 
 ```bash
 export MAPILLARY_ACCESS_TOKEN='MLY|...'
@@ -762,15 +941,23 @@ python3 services/harvest/harvest.py precheck --metro greenwich-pilot --samples 6
 60 samples rather than Pittsburgh's 40 because roughly 30% of the Greenwich box is Long
 Island Sound and water tiles dilute the estimate.
 
-### 12.5 Reading the verdict at this scale — the thresholds do not transfer
+### 12.5 Reading the verdict at this scale
 
-§0's verdict table (`≥100k` = GO, `<50k` = NO-GO) is **absolute**, and it was written
-for a 1,600 km city. The `greenwich-pilot` box supports **79,200 images at perfect
-coverage**, so it can never reach the GO line, and a genuinely usable harvest at 60% of
-its own sizing model trips the NO-GO line. The fallback text it prints ("widen to
-Allegheny County") is Pittsburgh boilerplate.
+**Fixed at the source on 2026-07-31.** This section used to describe a workaround. The
+absolute `≥100k` = GO / `<50k` = NO-GO thresholds were written for a 1,600 km city:
+the `greenwich-pilot` box supports **79,200 images at perfect coverage**, so it could
+never reach the GO line, and a genuinely usable harvest at 60% of its own sizing model
+tripped the NO-GO line — while the printed fallback ("widen to Allegheny County") was
+Pittsburgh boilerplate for a Connecticut box.
 
-Read the **ratio** instead — `projected_indexable_images / sizing_table_target`:
+`harvest.py precheck` now judges the **ratio below directly** (§0) and derives its
+fallback suggestion from the metro registry, so the tool and this section agree.
+`scripts/harvest/greenwich.sh` still prints the same interpretation and still offers
+`FORCE=1`; that override should no longer be needed to get past a scale mismatch,
+because a scale mismatch no longer produces a NO-GO.
+
+The ratio — `projected_indexable_images / sizing_table_target`, printed as
+`TARGET ATTAINMENT`:
 
 | ratio | reading |
 |---|---|
@@ -901,6 +1088,109 @@ across ten different streets — including one deliberately hard one, a hedge-li
 backcountry road with no signage — will tell you more about this index in twenty
 minutes than any aggregate. Log them as the first BENCH entries (§10). No other metro
 can be checked this way, which is exactly why the numbers above were worth trading away.
+
+### 12.9 Downtown Greenwich — the first real harvest, measured
+
+Everything above this line in §12 is projection. **This section is measurement**, from
+a completed run against the live API on **2026-08-01**. It is also the run that proved
+out the dense-bbox handling in §2: before that fix, this exact box completed zero tiles.
+
+```bash
+python3 services/harvest/harvest.py run \
+  --bbox='-73.640,41.015,-73.615,41.040' --include-panos \
+  --street-km 77 --db data/harvest/greenwich.sqlite \
+  --rate-fraction 0.1 --concurrency 4
+```
+
+The box is the downtown core — Greenwich Avenue, the Post Road, the I-95/Metro-North
+corridor — chosen because it is the best-covered part of the town (100% of tiles have
+imagery, against 72% town-wide) and because it is 9 root tiles, so an end-to-end test
+costs a minute rather than an afternoon.
+
+One number moved when the §2 fix landed, and it is worth knowing why. The pre-check
+that selected this box reported **median capture year 2022** — but that pre-check was
+silently dropping the two dense tiles. With them included the median is **2020**: those
+two tiles carry most of the 2018 bulge. The imagery did not get older; the measurement
+got honest. Town-wide is 2018.
+
+`street_km` is **76.84 km over 390 ways**, measured from OSM/Overpass on 2026-07-31
+inside this exact rectangle, not estimated:
+
+```
+way(41.0150,-73.6400,41.0400,-73.6150)["highway"~"^(motorway|trunk|primary|secondary|
+  tertiary|unclassified|residential|living_street|…_link)$"];
+make stat km=sum(length())/1000, n=count(ways);
+```
+
+That is 13.2 km/km², well above the 11 km/km² the ad-hoc estimator assumes — hence
+`--street-km 77`.
+
+**The run**
+
+| | measured |
+|---|---|
+| wall-clock | **65 s** |
+| API requests | **17** (9 root tiles, 2 refused, 8 quadrant children) |
+| retries / rate-limits | **0 / 0** — the density refusals cost no backoff at all |
+| JSON transferred | 15.6 MB |
+| tiles subdivided **for density** | **2** (both at depth 0 → depth 1) |
+| tiles subdivided **for the 2000-row cap** | **0** |
+| max subdivide depth reached | **1** |
+| leaf tiles complete | 15 (root grid 9) |
+| coverage gaps | **none** — every tile enumerated to completion |
+
+**The index**
+
+| | measured |
+|---|---|
+| indexable records kept | **1,593** |
+| ids considered | **19,504** |
+| discarded as `thinned_bucket_loser` | 15,910 |
+| with SfM (`computed_geometry`) | **1,583 (99.4%)** |
+| panoramas | **602 (37.8%)** — `--include-panos` was on |
+| distinct grid cells | **919** |
+| mean headings per cell | **1.73** |
+| density | **21 images/km** of street (practical target 200) |
+| target attainment | **~10%** |
+
+**Read it honestly — this box is dense but corridor-shaped.** 19,504 raw images
+collapse into 919 distinct 20 m cells. At 20 m per cell that is ~18.4 km of street with
+any imagery at all, out of 76.8 km in the box: **24% of the street network**. Every one
+of the 9 tiles has imagery, so this is not a hole-in-the-map problem — it is that
+contributors drove Greenwich Ave, US-1 and I-95 many times each and the residential
+side streets never. The pre-check predicted 1,540 indexable and the run kept 1,593,
+so the projection was accurate to 3%; the thinning is not the reason the number is
+small.
+
+`mean headings/cell 1.73` is the number to carry into BENCH. The distribution is
+487 cells with 1 heading, 228 with 2, 169 with 3, 32 with 4, 3 with 5 (a cell can
+exceed 4 because a panorama takes its own bucket). **Most covered cells are single-pass
+drive-bys**: retrieval from the same direction of travel should work, from the opposite
+direction much less so, and that is a recall limit of the index, not of the model.
+
+Capture years of kept records are genuinely fresh at the top end — 2024: 405,
+2023: 261, 2025: 176 — but the 2018 bulge is 442, so the median lands at 2020.
+**53% of the index (842 of 1,593) is 2023 or newer**, which is the number that matters
+for VPR recall.
+
+**The pre-check verdict for this box is `NO-GO — too sparse to match against`, at 10%
+attainment, and that is the correct answer.** It is no longer the old bug (failing a
+small box for being small — that verdict now cites density and would suggest
+`greenwich-pilot`, not Allegheny County). It is a real finding: 200 images/km across
+*all* streets is not what Mapillary has here. The harvest was run anyway, deliberately,
+because 1,593 real records on the town's main corridors is exactly what an end-to-end
+cascade test needs. **Record this caveat wherever BENCH caveats are recorded, and do
+not let a miss on a side street be attributed to the model.**
+
+The two bboxes the API refused outright were:
+
+```
+-73.6400000,41.0150000,-73.6310000,41.0240000   → 341 records after subdivision
+-73.6310000,41.0150000,-73.6220000,41.0240000   → 254 records after subdivision
+```
+
+**595 records, 37% of the whole index, came from boxes the harvester previously could
+not read.** That is the size of the §2 bug in one 9-tile run.
 
 ---
 
@@ -1064,3 +1354,286 @@ into a sentence a report can defend: *"street-level match against the Mapillary
 Greenwich index, build `mapillary-greenwich-pilot@2026-08-01`, harvested 2026-08-01,
 77% of modelled density, median capture year 2023."* That is a `verifiable` string in
 the sense `Evidence` requires. "Street precision available" on its own is not.
+
+---
+
+## 14. The fully local path — no Modal, no Supabase, no cloud account
+
+Everything above assumes two hosted services: a Modal GPU serving `/embed`, and a
+Supabase Postgres holding `mapillary_images` with an HNSW index. Neither exists yet,
+and standing them up is a bigger commitment than the question the operator actually
+wants answered first: **can I walk outside, photograph a Greenwich street, and see
+whether it matches?**
+
+This section is that path, running entirely on one laptop. It reuses the same
+`embed_index.py`, the same wire contract, the same `refine.ts` and the same
+invariants. Two things are swapped: the embedding service, and where the vectors
+live.
+
+| | Cloud path (§0–§13) | Local path (§14) |
+|---|---|---|
+| Embedding | Modal L4, `services/inference/app.py` | `services/inference/local_server.py`, CPU/MPS |
+| Descriptor | `eigenplaces-r50-512@1.0` | `eigenplaces-r50-512-local@1.0` |
+| Vectors | Postgres `mapillary_images.embedding halfvec(512)`, HNSW | `embeddings.vec` in the harvest SQLite |
+| Search | `search_geo_candidates()`, bbox WHERE then `<=>` | `src/lib/live/localIndex.ts`, bbox prune then exact cosine |
+| Coverage | `PostgrestCoverage`, `count=exact` | `LocalIndexCoverage`, counted from the file |
+
+The version string differs on purpose. Same weights and same transform, but fp32 on
+Apple MPS is not bit-identical to fp32 on an L4, and `ResultProvenance.models` is a
+reproducibility record. A local result must be distinguishable from a Modal one, not
+quietly interchangeable with it.
+
+### 14.1 Install
+
+```bash
+python3 -m venv services/inference/.venv
+services/inference/.venv/bin/pip install -r services/inference/requirements-local.txt
+```
+
+**Size, up front.** torch is the large download; the finished venv measures **729 MB
+on disk** (torch 2.13.0 + torchvision 0.28.0 + numpy + pillow + httpx, macOS arm64,
+Python 3.14.6). The first server start additionally pulls the `gmberton/EigenPlaces`
+and `gmberton/cosplace` checkouts and three checkpoints (~110 MB) into
+`.lantage-models/torch`, after which it starts offline.
+
+These deps are deliberately **not** in `services/harvest/requirements.txt`: a harvest
+run never touches a model, and making `harvest.py run` a 729 MB install would be a
+tax on the common case.
+
+### 14.2 Run the server
+
+```bash
+services/inference/.venv/bin/python services/inference/local_server.py            # :8000
+services/inference/.venv/bin/python services/inference/local_server.py --port 8010 # if 8000 is taken
+curl -s http://127.0.0.1:8000/health | python3 -m json.tool
+```
+
+It serves the same `EmbedRequestSchema` / `EmbedResponseSchema` as `app.py`:
+`POST /embed`, `POST /embed_batch`, `GET /health`. It loads **EigenPlaces ResNet-50 at
+512 dimensions** and nothing else — asking for `geoclip`, `megaloc` or `dinov2`
+returns 503 rather than a silently substituted descriptor.
+
+The hub entrypoint was verified against the live repo on 2026-07-31, not written from
+memory:
+
+```python
+# https://github.com/gmberton/EigenPlaces/blob/main/hubconf.py
+def get_trained_model(backbone: str = "ResNet50", fc_output_dim: int = 2048) -> torch.nn.Module
+AVAILABLE_TRAINED_MODELS["ResNet50"] == [128, 256, 512, 1024, 2048]
+```
+
+so `ResNet50 @ 512` is a published checkpoint. Two things about the load are worth
+knowing because they are surprising:
+
+- `GeoLocalizationNet_._get_backbone` does a **nested, untrusted**
+  `torch.hub.load("gmberton/cosplace", ...)` to initialise the ResNet before the
+  EigenPlaces checkpoint overwrites it. `trust_repo=True` on the outer call does not
+  propagate, so on a cold cache torch blocks on an interactive `y/N` prompt — which
+  in a background process is an `EOFError` during startup that reads like anything
+  but a trust question. `local_server.py` pre-writes both repos into
+  `<TORCH_HOME>/hub/trusted_list` to avoid it.
+- The network's aggregation already **ends in an `L2Norm`**, so its output is
+  unit-norm. The server normalises again anyway: cosine similarity assumes unit
+  vectors and `localIndex.ts` takes that on faith, so an unnormalised vector would be
+  a silent wrong-ranking bug rather than an error.
+
+**Preprocessing is copied verbatim from `app.py` and that is the point.**
+`Resize((512, 512), BICUBIC)` → `ToTensor` → ImageNet normalise, fp32. EigenPlaces'
+own test transform applies *no* resize (it is fully convolutional with GeM pooling),
+which means it happily returns a *different* descriptor for every input size with no
+error, no warning and no way to notice except collapsed recall. The 512 is part of
+the descriptor's identity. Change it and you have changed the model: bump
+`MODEL_VERSION` and re-embed the whole index.
+
+### 14.3 Embed the index
+
+`embed_index.py` runs **unmodified** — this is the same script §5 documents.
+
+```bash
+export MAPILLARY_ACCESS_TOKEN='MLY|...'          # so expired thumb URLs can be re-minted
+INFERENCE_SERVICE_URL=http://127.0.0.1:8000 \
+  python3 services/harvest/embed_index.py \
+    --db data/harvest/greenwich.sqlite --target sqlite \
+    --batch-size 16 --concurrency 3
+```
+
+One compatibility note that is otherwise a trap: `embed_index.py` posts
+`{"items": [...]}` to `/embed_batch` while `app.py` expects
+`{"images": [...], "models": [...]}`. Those disagree, which is why `--per-image`
+exists. `local_server.py` accepts **both** envelopes, so batch mode works with no
+flag. A per-item failure comes back as `{"error": ...}` in its own slot rather than
+failing the window, which is what lets the script re-mint one expired URL instead of
+losing the other 15 images.
+
+**Measured, 2026-08-01, M-series Mac, MPS, batch 16 × concurrency 3:**
+
+```
+1,593 / 1,593 images embedded    0 failures   0 dim violations   0 URLs re-minted
+102 s wall clock                 15.5 images/s               ~65 ms per image
+model load (incl. first download) 25.5 s      warm-up forward 1.7 s
+```
+
+All 1,593 vectors are 512-d and unit-norm (`max |‖v‖ − 1| < 1.2e-7`). Be a good
+citizen with the CDN: `--concurrency 3` keeps concurrent Mapillary fetches in the
+teens, and the whole job is under two minutes, so there is nothing to gain by
+pushing it.
+
+### 14.4 Point the app at it
+
+```bash
+# .env.local
+LANTAGE_LOCAL_INDEX=data/harvest/greenwich.sqlite
+# optional; implied as http://localhost:8000 when LANTAGE_LOCAL_INDEX is set
+LANTAGE_LOCAL_EMBED_URL=http://127.0.0.1:8010
+```
+
+`coverage.ts` and `refine.ts` fall back to the local backend **only** when Postgres is
+unconfigured. Postgres wins when both are set: it is the shared, audited index, and a
+laptop file silently shadowing it would make two operators disagree about what is
+covered. With neither set, behaviour is exactly what it was — `no-index-configured`,
+zero candidates, and the gap named.
+
+Search is **exact brute-force cosine with the bbox applied before scoring**, and both
+halves of that are deliberate:
+
+- *Brute force*, because 1,593 × 512 fp32 is ~3.3 MB and ~816k multiply-adds — a
+  sub-millisecond scan with **zero recall loss**. HNSW is approximate; it trades
+  recall for speed, and the failure this product cares about is a match that existed
+  and was not returned. Do not add an ANN index at this scale.
+- *Prune first*, matching the SQL path, because scoring first and filtering after
+  returns a **different and worse** answer, not merely a slower one — the nearest
+  neighbours of an ambiguous facade are scattered geographically.
+  `searchLocalIndex()` returns `scored` (rows that reached the dot product) so a test
+  can prove the ordering rather than a comment asserting it.
+
+### 14.5 Prove it end to end
+
+```bash
+LANTAGE_LOCAL_EMBED_URL=http://127.0.0.1:8010 \
+  node scripts/local-selfcheck.ts --db data/harvest/greenwich.sqlite --samples 8
+```
+
+It takes images already in the index, re-fetches those exact bytes, and pushes them
+through the **query** path — the `EmbedClient` interface, as base64, the way an
+uploaded photo travels — then searches. If index-time and query-time preprocessing
+agree, each must return at rank 1 with cosine ≈ 1.0.
+
+**Measured, 2026-08-01:**
+
+```
+rank-1 on 8/8 samples; self-similarity min 1.000000, mean 1.000000
+margin to next-best: 0.10 – 0.49
+```
+
+A value materially below 1.0 means the two sides preprocess differently. Nothing else
+in the system reports that: the server returns 200, the search returns rows, the UI
+renders candidates, and recall is quietly ruined. Fix it before trusting any match.
+
+### 14.6 What a FRESH photo should actually expect — measured, not promised
+
+Self-retrieval is an identity check on the plumbing. It is the ceiling, and it says
+nothing about a new photograph. Here is what the Greenwich index can actually
+support, measured on itself.
+
+**Coverage.** 1,593 images over 919 distinct 20 m grid cells ≈ 18.4 km of the box's
+76.8 km of street: **24% of the streets in the box are covered at all.** And
+1,593 / 919 = **1.73 headings per cell** — most covered cells were driven once, in one
+direction, on one day.
+
+**Leave-one-sequence-out retrieval.** Every indexed image used as a probe against the
+index with its own sequence removed — i.e. matched only against *different* captures,
+by different contributors, in different years:
+
+| | |
+|---|---|
+| top-1 within 25 m | **34.6%** |
+| top-1 within 100 m | 54.0% |
+| top-1 similarity ≥ 0.62 (the `streetPrecisionMinSimilarity` bar) | 28.7% |
+| **street precision earned AND correct (<25 m)** | **19.6%** |
+| street precision earned but wrong place (≥100 m) | 4.1% (65 of 1,593) |
+| median top-1 similarity | 0.544 |
+| median top-1 error | 69 m |
+
+**Heading is decisive.** Cosine between two *different* captures of the same spot
+(<25 m apart), by how much their headings differ:
+
+| heading difference | median cosine | share clearing 0.62 |
+|---|---|---|
+| within 30° | 0.374 | **21.3%** |
+| 30–90° | 0.202 | — |
+| 90–150° | 0.164 | — |
+| 150–180° (facing back down the street) | 0.190 | **1.0%** |
+| different place, >500 m apart | 0.109 | 0.01% |
+
+So, plainly:
+
+1. **A match is the minority outcome, not the expected one.** Standing where a
+   Mapillary car drove, facing the way it faced, roughly **one frame in five** produces
+   a correct street-precision candidate. Three-quarters of the box has no coverage at
+   all, so most streets cannot produce one at any orientation.
+2. **Facing the opposite way down a covered street will miss.** 1.0% of
+   opposite-heading pairs clear the bar — statistically indistinguishable from
+   photographing a different street. With 1.73 headings per cell, that is the common
+   case, not an edge case.
+3. **The false-positive rate is low, which is the part that holds up.** 0.01% of
+   >500 m-apart pairs clear 0.62. The residual risk is *near* misses: 4.1% of probes
+   earn street precision on something ≥100 m away. That is exactly why every candidate
+   carries a `vpr-match` whose `verifiable` string tells the analyst to open the
+   Mapillary image and compare it side by side. The similarity score is not the
+   evidence; the comparison is.
+
+Two caveats on the table above, both stated so the numbers are not read as better
+than they are. It is **favourable** as a proxy: probes are Mapillary car- and
+pano-camera captures processed exactly like the index, whereas a handheld phone photo
+at eye level carries an extra domain gap on top. And it is **pessimistic** in one
+respect: an operator can choose a well-covered corner and face the right way, which a
+uniform sample over the index cannot.
+
+### 14.7 The whole path, from nothing
+
+```bash
+# 1. install (once, 729 MB)
+python3 -m venv services/inference/.venv
+services/inference/.venv/bin/pip install -r services/inference/requirements-local.txt
+
+# 2. embedding service (leave running)
+services/inference/.venv/bin/python services/inference/local_server.py --port 8010
+
+# 3. harvest, if data/harvest/<metro>.sqlite does not exist yet — §0, §4
+export MAPILLARY_ACCESS_TOKEN='MLY|...'
+python3 services/harvest/harvest.py precheck --metro greenwich
+python3 services/harvest/harvest.py run --metro greenwich
+
+# 4. embed (1,593 images ≈ 2 min)
+INFERENCE_SERVICE_URL=http://127.0.0.1:8010 \
+  python3 services/harvest/embed_index.py \
+    --db data/harvest/greenwich.sqlite --target sqlite \
+    --batch-size 16 --concurrency 3
+
+# 5. prove the two sides preprocess identically — must read ~1.000000
+LANTAGE_LOCAL_EMBED_URL=http://127.0.0.1:8010 \
+  node scripts/local-selfcheck.ts --db data/harvest/greenwich.sqlite --samples 8
+
+# 6. wire the app
+echo 'LANTAGE_LOCAL_INDEX=data/harvest/greenwich.sqlite'   >> .env.local
+echo 'LANTAGE_LOCAL_EMBED_URL=http://127.0.0.1:8010'       >> .env.local
+npm run dev        # upload a photo, pick the Greenwich region, Refine
+
+# tests
+npx tsc --noEmit && node --test "src/**/*.test.ts"
+```
+
+### 14.8 Getting off the local path
+
+Nothing here is a dead end. The vectors carry over:
+
+```bash
+python3 services/harvest/embed_index.py --db data/harvest/greenwich.sqlite \
+  --export-embeddings data/harvest/greenwich.embeddings.ndjson
+```
+
+Then follow §6 — `harvest.py load` and `build_index.sql`. **Re-embed rather than
+importing** if the index will be shared: local vectors are stamped
+`eigenplaces-r50-512-local@1.0`, and mixing them with Modal-produced vectors in one
+HNSW index means two slightly different descriptor spaces ranked against each other,
+which degrades recall with nothing anywhere reporting it.

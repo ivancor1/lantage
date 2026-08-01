@@ -12,6 +12,12 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Python virtualenvs. `services/inference/.venv` contains torch, which ships
+    // bundled JS (torch/utils/model_dump/code.js) that ESLint otherwise lints
+    // and fails on — third-party vendored code we neither own nor edit.
+    "**/.venv/**",
+    // Locally cached model weights and hub checkouts.
+    ".lantage-models/**",
   ]),
 ]);
 

@@ -42,6 +42,7 @@ import {
   ok,
 } from '@/lib/cascade/types';
 import type { CapabilityGap, EnvLike, RefineBbox, RegionRefinement } from './contract';
+import { defaultLocalCoverageQuery } from './localIndex';
 
 // ---------------------------------------------------------------------------
 // Tunables, with the reason each has the value it has
@@ -121,6 +122,16 @@ export interface CoverageInfo {
   metros?: string[];
   /** Distinct index builds. Pinned into result provenance for reproducibility. */
   indexBuilds?: string[];
+  /**
+   * The full extent the backing index can answer for, when the backend knows it.
+   *
+   * PostgREST does not report it (an exact `min/max` over the whole table is a
+   * different, more expensive query than the bbox count), so it is absent there.
+   * The local SQLite backend does know it, and it is the difference between
+   * "0 rows here" and "0 rows here, and here is where this file actually
+   * reaches" — which is the answer an operator can act on.
+   */
+  extent?: Bbox;
   /** Present whenever `available` is false. Names the env var / command. */
   gap?: CapabilityGap;
 }
@@ -139,6 +150,8 @@ export interface CoverageCount {
    * from a role that cannot is not evidence of absence — see the file header.
    */
   authoritative: boolean;
+  /** Optional: the whole index's extent, when the backend can report it cheaply. */
+  extent?: Bbox;
 }
 
 export interface CoverageQuery {
@@ -328,10 +341,19 @@ function summariseRows(rows: unknown): { metros: string[]; indexBuilds: string[]
   return { metros: [...metros].sort(), indexBuilds: [...indexBuilds].sort() };
 }
 
-/** `undefined` resolves from env; the result is null when nothing is configured. */
+/**
+ * `undefined` resolves from env; the result is null when nothing is configured.
+ *
+ * Postgres wins when both are set: it is the shared, audited index, and a
+ * laptop file silently shadowing it would make two operators disagree about
+ * what is covered. `LANTAGE_LOCAL_INDEX` is the fallback for the no-cloud path
+ * (docs/HARVEST.md §14). With neither set the answer is null, and
+ * `getCoverage` reports `no-index-configured` exactly as before.
+ */
 export function defaultCoverageQuery(env: EnvLike = process.env): CoverageQuery | null {
   const endpoint = resolveIndexEndpoint(env);
-  return endpoint ? new PostgrestCoverage(endpoint) : null;
+  if (endpoint) return new PostgrestCoverage(endpoint);
+  return defaultLocalCoverageQuery(env);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +424,10 @@ export async function getCoverage(
     };
   }
 
-  const { rows, metros, indexBuilds, authoritative } = counted.value;
+  const { rows, metros, indexBuilds, authoritative, extent } = counted.value;
+  // Only spread when present, so the PostgREST path's shape is byte-identical to
+  // what it was before the local backend existed.
+  const withExtent = extent ? { extent } : {};
 
   if (rows === 0 && !authoritative) {
     return {
@@ -422,12 +447,12 @@ export async function getCoverage(
     return {
       available: false,
       code: 'no-rows-in-area',
-      reason:
-        'Counted 0 indexed street images inside this area. Mapillary coverage is contributed, not systematic, so a gap here is normal — and a region-level result is not re-labelled as street-level to paper over it.',
+      reason: `Counted 0 indexed street images inside this area. Mapillary coverage is contributed, not systematic, so a gap here is normal — and a region-level result is not re-labelled as street-level to paper over it.${extentClause(extent)}`,
       bbox,
       indexedImages: 0,
       metros,
       indexBuilds,
+      ...withExtent,
       gap: {
         ...STREET_INDEX_GAP,
         impact:
@@ -439,12 +464,26 @@ export async function getCoverage(
   return {
     available: true,
     code: 'covered',
-    reason: `${rows.toLocaleString('en-US')} indexed street image${rows === 1 ? '' : 's'} inside this area${metros.length > 0 ? `, across ${metros.length} metro submap${metros.length === 1 ? '' : 's'} (${metros.join(', ')})` : ''}. Street precision is available here — subject to a match actually being found.`,
+    reason: `${rows.toLocaleString('en-US')} indexed street image${rows === 1 ? '' : 's'} inside this area${metros.length > 0 ? `, across ${metros.length} metro submap${metros.length === 1 ? '' : 's'} (${metros.join(', ')})` : ''}. Street precision is available here — subject to a match actually being found.${extentClause(extent)}`,
     bbox,
     indexedImages: rows,
     metros,
     indexBuilds,
+    ...withExtent,
   };
+}
+
+/**
+ * "Where does this index actually reach" — one clause, only when known.
+ *
+ * Counted rows say what is here; the extent says what is anywhere. Without it,
+ * an operator reading "0 rows" cannot tell a genuine coverage hole from a
+ * refine bbox that missed the harvested box entirely, and those two need
+ * opposite fixes.
+ */
+function extentClause(extent: Bbox | undefined): string {
+  if (!extent) return '';
+  return ` The index it was counted in spans [${extent.map((n) => n.toFixed(4)).join(', ')}].`;
 }
 
 // ---------------------------------------------------------------------------
