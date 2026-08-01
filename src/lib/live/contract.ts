@@ -26,6 +26,9 @@ import type {
   StageTrace,
   VehicleCandidate,
 } from '@/lib/contracts/types';
+// Type-only, and therefore erased: `coverage.ts` imports `CapabilityGap` back
+// out of this file, so a value import in either direction would be a real cycle.
+import type { CoverageCode, CoverageInfo } from './coverage';
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -150,6 +153,15 @@ export interface LiveAnalyzeResponse {
   face?: FaceComparison;
   /** Present for INTERIOR — where else this image appears publicly. */
   provenanceHits?: ProvenanceHit[];
+  /**
+   * Per-region answer to "can this be refined to street level, and where".
+   *
+   * Additive and optional: a response without it is a response from a build that
+   * did not run the coverage probe, which is not the same as "nothing is
+   * refinable". The UI renders the "Refine in {region}" affordance only for the
+   * entries whose `refinable` is true.
+   */
+  refinable?: RegionRefinement[];
   /** Evidence not attached to a specific candidate — EXIF, C2PA, operator hints. */
   evidence: Evidence[];
   stages: StageTrace[];
@@ -177,6 +189,136 @@ export interface CapabilityGap {
   envVar?: string;
   /** e.g. 'https://console.anthropic.com/settings/keys' */
   howTo?: string;
+}
+
+// ---------------------------------------------------------------------------
+// REFINE — stage 2 of the two-stage search
+// ---------------------------------------------------------------------------
+
+/**
+ * The flow these types describe, and why it is two stages rather than one.
+ *
+ *   Stage 1 (LOCATE) runs worldwide and returns ranked REGIONS, each with a
+ *   radius and a confidence: "Austin, ~15 mile radius, 4 of 5 results here."
+ *   That is all inference can honestly buy — best published street-level (1 km)
+ *   accuracy on the only area-weighted benchmark is 0.7%.
+ *
+ *   Stage 2 (REFINE) is operator-triggered, one region at a time, and is the
+ *   only thing that can produce `precision: 'street'`. It runs an ANN search
+ *   *inside* that region's bbox against the Mapillary index, so every street
+ *   candidate carries a `vpr-match` an analyst can open and compare.
+ *
+ * The split is not a UI convenience. A single-stage search either scans the
+ * planet — where the nearest neighbours of an ambiguous facade are globally
+ * scattered — or silently returns the region again with a street label on it.
+ */
+
+/** [west, south, east, north] = [minLon, minLat, maxLon, maxLat]. Lon first. */
+export type RefineBbox = [west: number, south: number, east: number, north: number];
+
+/** The stage-1 region a refinement is scoped to. Carried through so the result names it. */
+export interface RefineRegion {
+  /** `GeoCandidate.id` from the stage-1 response, when refining one of its regions. */
+  candidateId?: string;
+  label: string;
+  admin1?: string;
+  country?: string;
+}
+
+/**
+ * A legible sign stage 1 already read, forwarded so stage 2 can geocode it.
+ *
+ * Deliberately narrower than `VlmClues['text']`: phone numbers are a directory
+ * lookup we do not license and plate characters are prohibited output, so
+ * neither kind can be forwarded here at all.
+ */
+export interface RefineSignageClue {
+  observed: string;
+  legibility: 'clear' | 'partial' | 'guessed';
+  kind: 'business-name' | 'street-sign' | 'address-number' | 'transit-sign';
+  /** Normalised 0..1 box, so the citation can be cropped next to the claim. */
+  bbox?: [number, number, number, number];
+}
+
+export interface LiveRefineRequest {
+  /** Upload id returned by POST /api/upload — the same frame stage 1 ran on. */
+  uploadId: string;
+  region: RefineRegion;
+  /**
+   * REQUIRED, and not optional-by-convenience: this is the prune. An unbounded
+   * refine is refused with a `policy` failure, exactly as `vprRetrieval` refuses
+   * an unpruned index scan.
+   */
+  bbox: RefineBbox;
+  /** Signage stage 1 read, if any. Optional: it boosts, it does not seed. */
+  signage?: RefineSignageClue[];
+}
+
+/**
+ * Why a refinement produced nothing at all. Distinct from "ran and found no
+ * match", which is a normal zero-candidate result with a coverage reason.
+ */
+export type RefineRefusalKind =
+  /** The scope was missing, inverted, or so large it prunes nothing. */
+  | 'policy'
+  /** No such upload, or its bytes are unreadable. */
+  | 'no-input'
+  /** The frame failed the quality gate, so no ranking may be returned. */
+  | 'quality-gate'
+  /** A dependency needed to search is not wired. */
+  | 'not-configured'
+  | 'budget-exhausted';
+
+export interface RefineResult {
+  id: string;
+  uploadId: string;
+  region: RefineRegion;
+  /** The scope the search actually ran in. Echoed so the map can draw it. */
+  bbox: RefineBbox;
+  /** What the index does and does not cover here. Always present. */
+  coverage: CoverageInfo;
+  quality: QualityGate;
+  /**
+   * Ranked street candidates, up to `REFINE.maxCandidates`. Empty whenever the
+   * index does not cover the region — and empty is the honest answer there. A
+   * region-level guess is never returned in this array.
+   */
+  candidates: GeoCandidate[];
+  /** Evidence not attached to one candidate. */
+  evidence: Evidence[];
+  stages: StageTrace[];
+  /** Capabilities that were unavailable, with the env var / command that fixes each. */
+  unavailable: CapabilityGap[];
+  provenance: {
+    models: Record<string, string>;
+    sources: Record<string, string>;
+    /** e.g. 'mapillary-pittsburgh@2026-08-02'. Reproducibility is a Daubert requirement. */
+    indexBuild?: string;
+    totalCostUsd: number;
+  };
+  /** Present when the search did not run at all. */
+  refusal?: { kind: RefineRefusalKind; reason: string };
+  createdAt: string;
+}
+
+/**
+ * Stage-1 annotation: whether a region carries a working "Refine in {region}"
+ * affordance, and the bbox that click must send.
+ */
+export interface RegionRefinement {
+  /** The `GeoCandidate.id` this describes. */
+  candidateId: string;
+  /** True only when rows were counted inside `bbox`. Drives the button. */
+  refinable: boolean;
+  /** Plain English, shown when the button is absent. */
+  reason: string;
+  coverage: CoverageCode;
+  /** Scope a refine call must be made with. Derived from the region's own radius. */
+  bbox: RefineBbox;
+  /** Metro submaps covering it — the "2 regions available" sub-count. */
+  metros: string[];
+  /** Exact rows counted. Absent when nothing could be counted. */
+  indexedImages?: number;
 }
 
 // ---------------------------------------------------------------------------

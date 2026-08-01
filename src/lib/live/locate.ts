@@ -66,9 +66,15 @@ import { type EnvLike, type LiveVisionProvider, selectProvider, sumCostUsd } fro
  *
  * Deliberately larger than `CASCADE_BUDGET_MS` (10s). The cascade's budget is
  * sized for a six-stage pipeline where the VLM is one gated call among several;
- * LOCATE *is* the vision call, has no retrieval to preserve time for, and runs
- * against frontier models where a single structured extraction over a 1568px
- * frame legitimately takes 10-20s.
+ * LOCATE *is* the vision call and has no retrieval to preserve time for.
+ *
+ * Measured 2026-07-31 on the current defaults (`scripts/bench-locate.ts`, 12 runs,
+ * 1568px frame): the vision call is 6.8-9.3s, and everything else in this module
+ * together is under 5ms. It was 22.4s before the model and reasoning-effort
+ * defaults changed, which is where the old "10-20s legitimately" note came from.
+ * The ceiling stays well above the median on purpose — one run in that set stalled
+ * at the vendor and was cut off by the 30s vision timeout, and a budget trimmed to
+ * the median would convert ordinary tail latency into a refusal.
  */
 export const LOCATE_BUDGET_MS = 45_000;
 
@@ -129,8 +135,22 @@ const RANKING_GAP: CapabilityGap = {
 // ---------------------------------------------------------------------------
 
 export interface LocateInput {
-  /** Upload id. Used as the image id in every evidence citation. */
-  uploadId: string;
+  /**
+   * Upload id. Used as the image id in every evidence citation and in every crop
+   * URL, so it is the difference between a checkable citation and a dead link.
+   *
+   * Optional here only because the orchestrator's LOCATE adapter does not send
+   * this key — it sends `upload` and `image` instead. It went unnoticed because
+   * nothing throws on a missing id: candidates came back as `undefined-region-1`
+   * with crops at `/api/images/undefined/crop`, which is a silently broken
+   * evidence trail rather than an error. `resolveUploadId` accepts any of the
+   * three, so both callers work.
+   */
+  uploadId?: string;
+  /** The upload record, as the orchestrator's adapter passes it. */
+  upload?: { id?: string };
+  /** The resolved image reference, as the orchestrator's adapter passes it. */
+  image?: ImageRef;
   /** The bytes as uploaded. Never a URL: vendors cannot reach local disk. */
   bytes: Uint8Array;
   mime?: string;
@@ -138,6 +158,31 @@ export interface LocateInput {
   hints?: LiveAnalyzeRequest['hints'];
   budgetMs?: number;
   signal?: AbortSignal;
+  /**
+   * The caller's own quality gate, when it already ran one.
+   *
+   * Supplying this means "preprocess and the quality gate are already done and
+   * already reported" — the orchestrator runs both before dispatching, and passes
+   * the verdict in. LOCATE then neither re-runs the gate nor emits its own
+   * `preprocess` / `quality-gate` traces, which is what produced two of each row
+   * in a real run's stage list. Omit it and LOCATE does the whole thing itself,
+   * which is how the unit tests and the bench drive it.
+   */
+  quality?: QualityGate;
+  /** Container dimensions, when the caller already read them. */
+  header?: HeaderInfo;
+  /** EXIF/XMP facts, when the caller already extracted them. */
+  metadata?: MetadataFacts;
+}
+
+/**
+ * The id, from whichever field the caller populated.
+ *
+ * Falls back to a marker string rather than `undefined`: an id that reads as a
+ * missing id in a crop URL is debuggable, and `'undefined'` is not.
+ */
+export function resolveUploadId(input: LocateInput): string {
+  return input.uploadId ?? input.upload?.id ?? input.image?.imageId ?? 'unknown-upload';
 }
 
 /** A region the model named that could not be placed on the globe. */
@@ -186,28 +231,39 @@ export async function locate(input: LocateInput, deps: LocateDeps = {}): Promise
   const models: Record<string, string> = {};
   const unresolvedRegions: UnresolvedRegion[] = [];
 
+  const uploadId = resolveUploadId(input);
+  // The caller already ran and reported both local steps; re-running them would
+  // duplicate the work and, more visibly, duplicate the rows a reader sees in the
+  // stage list.
+  const callerAlreadyMeasured = input.quality !== undefined;
+
   // --- 1. preprocess: header + metadata, both local ------------------------
   const preprocessStart = Date.now();
-  const header = readImageHeader(input.bytes);
-  const metadata = await extractMetadata(input.bytes);
-  evidence.push(...metadataEvidence(metadata, header, input.uploadId));
+  const header = input.header ?? readImageHeader(input.bytes);
+  const metadata = input.metadata ?? (await extractMetadata(input.bytes));
+  evidence.push(...metadataEvidence(metadata, header, uploadId));
   models.exif = 'exifr@7';
-  stages.push({ stage: 'preprocess', ranMs: Date.now() - preprocessStart, costUsd: 0 });
+  if (!callerAlreadyMeasured) {
+    stages.push({ stage: 'preprocess', ranMs: Date.now() - preprocessStart, costUsd: 0 });
+  }
 
   // --- 2. quality gate ----------------------------------------------------
   const gateStart = Date.now();
   const image: ImageRef = {
-    imageId: input.uploadId,
+    imageId: uploadId,
     bytes: input.bytes,
     ...(input.mime ? { mimeType: input.mime } : {}),
   };
-  const quality = evaluateQualityGate({ image, header, metadata, bytes: input.bytes });
-  stages.push({
-    stage: 'quality-gate',
-    ranMs: Date.now() - gateStart,
-    costUsd: 0,
-    ...(quality.passed ? {} : { skipped: { reason: quality.refusalReason ?? 'refused' } }),
-  });
+  const quality =
+    input.quality ?? evaluateQualityGate({ image, header, metadata, bytes: input.bytes });
+  if (!callerAlreadyMeasured) {
+    stages.push({
+      stage: 'quality-gate',
+      ranMs: Date.now() - gateStart,
+      costUsd: 0,
+      ...(quality.passed ? {} : { skipped: { reason: quality.refusalReason ?? 'refused' } }),
+    });
+  }
 
   if (!quality.passed) {
     // A failed gate returns no ranking. The metadata evidence still ships — it is
@@ -302,7 +358,7 @@ export async function locate(input: LocateInput, deps: LocateDeps = {}): Promise
     modelCoordinates: extraction.value.regionCoordinates,
     geocoder,
     budget,
-    uploadId: input.uploadId,
+    uploadId,
     ...(input.signal ? { signal: input.signal } : {}),
     ...(input.hints?.bbox ? { bbox: input.hints.bbox } : {}),
   });

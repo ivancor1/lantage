@@ -15,11 +15,30 @@
  * `store: false` is deliberate: investigative imagery should not sit in a vendor
  * dashboard because a default was left alone.
  *
- * The default model is `gpt-5.5`, which is what the current official SDK README
- * uses in every vision example. Cheaper current models exist (`gpt-5.6-terra`,
- * `gpt-5.6-luna`) and are priced in `pricing.ts`, but their vision behaviour was
- * not verified here, so they are an opt-in via `LANTAGE_OPENAI_VLM_MODEL` rather
- * than a default chosen on price.
+ * DEFAULTS, AND WHAT THEY WERE MEASURED AGAINST (2026-07-31, `scripts/bench-locate.ts`,
+ * a 2560x1440 outdoor Street View frame with a known ground truth):
+ *
+ *   model   `gpt-5.6-luna`, replacing `gpt-5.5`. Not chosen on price alone —
+ *           `gpt-5.5`, `gpt-5.6-terra` and `gpt-5.6-luna` were each run on the
+ *           same frame and returned the SAME 17 text observations, the same
+ *           region prior at the same self-reported confidence, and the same
+ *           confidence band. On a second frame with no legible text, all three
+ *           set `insufficientSignal` and named no region — the cheap model
+ *           declines to guess exactly where the expensive one does, which is the
+ *           failure mode that actually matters here. At matched effort luna is
+ *           5.3x cheaper per search than gpt-5.5 and about half its latency
+ *           (7.4s p50 against 12.3-13.6s).
+ *
+ *   effort  `none`. `reasoning.effort` is the single largest latency term: on
+ *           gpt-5.5 the vendor default spent 516 hidden reasoning tokens and
+ *           22.4s, against 12.4s at `none` for an identical clue list. This is a
+ *           schema-constrained extraction of what is visible in a frame — the
+ *           model is enumerating, not deducing — so extended reasoning buys
+ *           nothing and is billed at the output rate.
+ *
+ * Both stay overridable (`LANTAGE_OPENAI_VLM_MODEL`,
+ * `LANTAGE_OPENAI_REASONING_EFFORT`): a default is a measurement, not a policy,
+ * and a harder corpus may well justify escalating.
  */
 
 import { z } from 'zod';
@@ -41,9 +60,24 @@ import {
   type VisionUsage,
 } from './types';
 
-const DEFAULT_MODEL = 'gpt-5.5';
+const DEFAULT_MODEL = 'gpt-5.6-luna';
 const DEFAULT_BASE_URL = 'https://api.openai.com';
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
+
+/**
+ * Only the gpt-5 and o-series families accept `reasoning.effort` at all — gpt-4o
+ * answers HTTP 400 "Unsupported parameter" (probed 2026-07-31) — so the field is
+ * gated on the model id rather than sent unconditionally. Without the gate, an
+ * operator setting `LANTAGE_OPENAI_VLM_MODEL=gpt-4o` would get a hard 400 from a
+ * default they never chose.
+ */
+const REASONING_MODEL_PATTERN = /^(gpt-5|o1|o3|o4)/i;
+
+export function supportsReasoningEffort(model: string): boolean {
+  return REASONING_MODEL_PATTERN.test(model.trim());
+}
+
+const DEFAULT_REASONING_EFFORT = 'none';
 
 const ResponseSchema = z.object({
   id: z.string().optional(),
@@ -73,6 +107,7 @@ const ResponseSchema = z.object({
       input_tokens: z.number().optional(),
       output_tokens: z.number().optional(),
       input_tokens_details: z.object({ cached_tokens: z.number().nullish() }).nullish(),
+      output_tokens_details: z.object({ reasoning_tokens: z.number().nullish() }).nullish(),
     })
     .optional(),
 });
@@ -84,12 +119,15 @@ export interface OpenAiVisionOptions {
   model?: string;
   baseUrl?: string;
   maxLongEdgePx?: number;
+  /** 'none' | 'low' | 'medium' | 'high' | 'xhigh'. Ignored by non-reasoning models. */
+  reasoningEffort?: string;
 }
 
 export class OpenAiVisionProvider implements LiveVisionProvider {
   readonly vendor: VisionVendor = 'openai';
   readonly model: string;
   readonly name: string;
+  readonly reasoningEffort: string | undefined;
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly maxLongEdgePx: number | undefined;
@@ -99,6 +137,12 @@ export class OpenAiVisionProvider implements LiveVisionProvider {
     this.model = opts.model ?? process.env.LANTAGE_OPENAI_VLM_MODEL ?? DEFAULT_MODEL;
     this.baseUrl = (opts.baseUrl ?? process.env.OPENAI_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.maxLongEdgePx = opts.maxLongEdgePx;
+    const effort =
+      opts.reasoningEffort ?? process.env.LANTAGE_OPENAI_REASONING_EFFORT ?? DEFAULT_REASONING_EFFORT;
+    // '' or 'default' means "send no reasoning field and take the vendor's own
+    // default" — the escape hatch for a model whose supported values change.
+    this.reasoningEffort =
+      effort && effort !== 'default' && supportsReasoningEffort(this.model) ? effort : undefined;
     this.name = `openai:${this.model}`;
   }
 
@@ -238,6 +282,9 @@ export class OpenAiVisionProvider implements LiveVisionProvider {
         ...(res.usage?.input_tokens_details?.cached_tokens == null
           ? {}
           : { cachedInputTokens: res.usage.input_tokens_details.cached_tokens }),
+        ...(res.usage?.output_tokens_details?.reasoning_tokens == null
+          ? {}
+          : { reasoningTokens: res.usage.output_tokens_details.reasoning_tokens }),
       },
     });
   }
@@ -273,6 +320,7 @@ export class OpenAiVisionProvider implements LiveVisionProvider {
       body: {
         model: this.model,
         max_output_tokens: maxOutputTokens,
+        ...(this.reasoningEffort ? { reasoning: { effort: this.reasoningEffort } } : {}),
         // Investigative imagery does not get retained in a vendor dashboard by
         // default. This is a privacy setting, not a performance one.
         store: false,
@@ -284,6 +332,15 @@ export class OpenAiVisionProvider implements LiveVisionProvider {
             role: 'user',
             content: [
               // Image first: the frame is the subject, the prompt is the question.
+              //
+              // Reordering to put the (byte-identical) prompt first was tried as a
+              // prompt-cache play and MEASURED NOT TO WORK, 2026-07-31: with four
+              // different images behind the same 2.4k-token text prefix,
+              // `cached_tokens` was 0 every time, with or without
+              // `prompt_cache_key`. Only a byte-identical repeat of the whole
+              // request cached (5,131 of 5,408). Since every real search carries a
+              // new image, there is no cacheable prefix to win, so the ordering
+              // stays as it was rather than changing for a benefit that isn't there.
               {
                 type: 'input_image',
                 image_url: `data:${mediaType};base64,${base64}`,

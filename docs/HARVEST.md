@@ -4,7 +4,11 @@ Owner: B3. Sizing rationale and the three irreversible decisions: `docs/MASTER_P
 Row shape: `MapillaryRecordSchema` in `src/lib/contracts/schemas.ts`.
 
 This is the pipeline that turns Mapillary's public imagery into the retrieval index
-behind GEO/STREET. Metro #1 is Pittsburgh.
+behind GEO/STREET. **Metro #1 is Greenwich, CT** as of 2026-07-31 — see §12, which has
+the bboxes, the measured street mileage, the projected counts and the one command
+sequence to run. Pittsburgh is metro #2 and stays fully defined; everything in §0–§11
+below is written against Pittsburgh and still applies unchanged, except where §12 says
+a threshold does not transfer to a metro this size.
 
 ```
 harvest.py precheck   measure real coverage        ~40 requests, <1 min   ← ALWAYS FIRST
@@ -621,10 +625,442 @@ can be harvested concurrently and resumed independently.
 | Path | What |
 |---|---|
 | `services/harvest/mapillary_api.py` | v4 client: token buckets, backoff, field allowlist, bbox guards |
+| `services/harvest/metros.py` | metro registry: bboxes + measured `street_km` + provenance, projection maths, coverage-manifest row. Stdlib only — see §12 |
 | `services/harvest/harvest.py` | CLI: `precheck` · `run` · `stats` · `export` · `load`; tiling, thinning, SQLite checkpoint |
 | `services/harvest/embed_index.py` | EigenPlaces-512 via B1's service; SQLite or Postgres write-back |
 | `services/harvest/build_index.sql` | HNSW build: `maintenance_work_mem`, `halfvec`, cosine ops, gates, `ANALYZE` |
 | `services/harvest/attribution.ts` | Mapillary §11 attribution spec + helpers for A1 |
 | `services/harvest/requirements.txt` | `httpx`, `psycopg` |
-| `scripts/harvest/pittsburgh.sh` | the runbook, executable |
-| `data/harvest/` | checkpoints and exports (gitignored) |
+| `scripts/harvest/greenwich.sh` | metro #1, the runbook executable — `plan` · `precheck` · … · `manifest` |
+| `scripts/harvest/pittsburgh.sh` | metro #2, same shape |
+| `data/harvest/` | checkpoints, exports, pre-check reports, coverage manifests (gitignored) |
+
+---
+
+## 12. Greenwich, CT — metro #1
+
+Metro #1 moved from Pittsburgh to Greenwich on 2026-07-31 for one reason: **the operator
+lives there.** Every other candidate makes ground truth a research project. Here, a
+disagreement between the index and reality is settled by walking outside with a phone,
+so the feedback loop is minutes instead of never. That is worth more than street
+mileage, and it is the only justification this decision needs. Pittsburgh is not
+deleted — it is metro #2, unchanged, in `metros.py` and `scripts/harvest/pittsburgh.sh`.
+
+### 12.1 The bboxes, and where they came from
+
+All four boxes are derived from OpenStreetMap on **2026-07-31**, not estimated. Each
+entry in `services/harvest/metros.py` carries its own `source` string with the exact
+Nominatim relation and Overpass query; `metros.py --overpass <slug>` reprints the query
+so any number here can be re-measured or audited.
+
+| slug | bbox (`minLon,minLat,maxLon,maxLat`) | size | derived from |
+|---|---|---|---|
+| `greenwich-pilot` | `-73.6620,40.9880,-73.5530,41.0500` | 9.2 × 6.9 km | built-up shoreline strip: Byram → Old Greenwich |
+| `greenwich` | `-73.7290,40.9860,-73.5530,41.1450` | 14.8 × 17.7 km | Nominatim relation **4119957** (Town of Greenwich) |
+| `stamford` | `-73.5530,40.9860,-73.4945,41.1810` | 4.9 × 21.7 km | Nominatim relation **3306055**, west edge clipped |
+| `fairfield-lower` | `-73.7290,40.9860,-73.1000,41.2600` | 52.7 × 30.5 km | Greenwich → Stratford coastal band |
+| `fairfield` | `-73.7290,40.9860,-73.0645,41.6675` | 55.6 × 75.9 km | Nominatim relation **2516994** (historic county) |
+
+Two adjustments were made to the raw administrative extents, and both matter:
+
+- **The southern edge is trimmed to 40.9860, not the legal 40.9510.** Every Connecticut
+  coastal town's boundary runs out into Long Island Sound to the New York state line.
+  Greenwich's does; so does the county's. An Overpass `out bb` over relation 4119957
+  puts the southernmost *mapped road* at **40.98848 N** (Great Captain Island). Below
+  that is open water. The trim removes 2 full rows from the Greenwich root grid and 20
+  from the county grid at zero cost in imagery.
+- **Stamford's west edge is clipped from −73.6340 to −73.5530** so it abuts the
+  Greenwich box rather than overlapping it by ~7 km. This is not cosmetic. `mapillary_id`
+  is the primary key and `load` is `ON CONFLICT DO NOTHING`, so an image found by two
+  harvests keeps whichever `metro` label was loaded first — and the second metro's row
+  count then silently under-reports its own area. Clipping keeps `metro` an actual
+  partition. West Stamford is still covered; it is covered by the `greenwich` box.
+
+### 12.2 The number that will surprise you
+
+The town of Greenwich has **667 km** of drivable public street inside its polygon
+(Overpass, 2026-07-31). Pittsburgh has 1,600 km. That 2.4× is the whole reason this
+metro is cheap, and it is real.
+
+But **the harvester enumerates a rectangle, not a polygon.** Greenwich is a tall narrow
+parallelogram wedged against the New York line, so its bounding rectangle also contains
+**511 km of New York State** (Port Chester, Rye Brook, Purchase, Armonk) and ~197 km of
+west Stamford. Measured inside the actual `greenwich` bbox: **1,375 km**, 4,826 ways.
+
+So stage 1 projects **275,000 images, not 133,000.** Budget against the rectangle
+figure, always — `metros.py` stores `street_km` measured inside the bbox for exactly
+this reason, and `precheck`'s `sizing_table_target` is derived from it.
+
+The New York spill is not waste. It is contiguous suburban Northeast within a
+ten-minute drive of the operator, which makes it testable ground truth too. It does
+double the embed bill, which is what `greenwich-pilot` exists to avoid.
+
+### 12.3 Staging, with the vector budget checked at every step
+
+`street_km × 200` is the "Practical (20 m, 4 headings)" row of MASTER_PLAN §3. Run
+`python3 services/harvest/metros.py --ladder greenwich` for this table live.
+
+| stage | slug | street km in bbox | root tiles | images | vectors | cumulative | % of ~3M instance |
+|---|---|---|---|---|---|---|---|
+| 0 | `greenwich-pilot` | 396 | 91 | **79,200** | 81 MB | 79,200 | 3% |
+| 1 | `greenwich` | 1,375 | 360 | **275,000** | 282 MB | 275,000 | 9% |
+| 2 | `stamford` | 593 | 154 | **118,600** | 121 MB | 393,600 | 13% |
+| 3 | `fairfield-lower` | 6,206 | 2,170 | **1,241,200** | 1,271 MB | 1,241,200 | 41% |
+| — | `fairfield` | 14,380 | 5,624 | **2,876,000** | 2,945 MB | — | **96% — does not fit** |
+
+Stage 2 is an **increment**, not a superset: harvest `stamford` *alongside* `greenwich`,
+and the pair tiles the area between them with no interior overlap. Stage 3 *is* a
+superset of stages 0–2, so if you have already loaded them their rows keep their own
+`metro` labels and only the new area lands under `fairfield-lower`. That is correct
+behaviour, and §13 is how the API copes with it. **If lower Fairfield is where you are
+going anyway, harvest that box first and skip stages 1–2** — re-walking tiles is cheap,
+re-embedding the same 275k images under a second slug is not.
+
+**Full Fairfield County does not fit, and the arithmetic is worth writing down.** Inside
+the county polygon it is 8,369 km ⇒ 1.67M vectors — already 56% of the instance budget.
+But the county is an L wrapped around the New York line, so its *rectangle* swallows
+Westchester and Putnam counties NY and part of New Haven County CT: **14,380 km ⇒ 2.88M
+vectors**, over the ≤2M-per-metro ceiling and over the ~3M-per-instance ceiling at once,
+with nothing left for metro #2. Three ways out, in preference order: (1) stop at
+`fairfield-lower`; (2) harvest the county as several bboxes tracking its actual shape,
+each its own metro; (3) treat it as the documented MASTER_PLAN §3 migration trigger to
+Qdrant or Turbopuffer. Dropping to lean density (100 img/km) still gives 1.44M and buys
+nothing but a thinner index.
+
+### 12.4 Coverage: there is no way to measure it without a token, and here is the proof
+
+`harvest.py precheck` needs `MAPILLARY_ACCESS_TOKEN`. Before writing that off as a
+formality, every unauthenticated route was tried on **2026-07-31**:
+
+| Probe | Result |
+|---|---|
+| `GET graph.mapillary.com/images?bbox=…` no auth | HTTP 500, `OAuthException` code 190 "Invalid OAuth 2.0 Access Token" |
+| `GET graph.mapillary.com/<image_id>` no auth | same |
+| `GET tiles.mapillary.com/maps/vtp/mly1_public/2/{z}/{x}/{y}` no token | **HTTP 403**, 0 bytes |
+| `GET tiles.mapillary.com/maps/vtp/mly_map_feature_point/…` no token | **HTTP 403**, 0 bytes |
+| legacy `a.mapillary.com/v3/images` | host no longer resolves |
+| OSM objects tagged `mapillary=*` as a proxy | 6 in Greenwich, 1 in Pittsburgh — measures OSM mapper convention, not Mapillary coverage. Dead end; do not retry it |
+
+The API documentation agrees: *"All requests against `https://graph.mapillary.com` and
+`https://tiles.mapillary.com` must be authorized."* **There is no unauthenticated
+endpoint and no public coverage tile.** The web viewer at `www.mapillary.com/app` does
+render coverage without a login, and a human is welcome to eyeball it in a browser —
+but this pipeline does not touch `www.mapillary.com` (Terms §5, and see the
+`mapillary_api.py` module docstring), and borrowing the client token embedded in that
+page's JavaScript is somebody else's credential, not ours.
+
+So: **Fairfield County is dense suburban Northeast and probably has good contributor
+coverage — and "probably" is not a number.** Nothing in this repo asserts Greenwich
+coverage. The pre-check is one command and it is the first thing the script runs:
+
+```bash
+export MAPILLARY_ACCESS_TOKEN='MLY|...'
+python3 services/harvest/harvest.py precheck --metro greenwich-pilot --samples 60 \
+  --json-out data/harvest/greenwich-pilot.precheck.json
+```
+
+60 samples rather than Pittsburgh's 40 because roughly 30% of the Greenwich box is Long
+Island Sound and water tiles dilute the estimate.
+
+### 12.5 Reading the verdict at this scale — the thresholds do not transfer
+
+§0's verdict table (`≥100k` = GO, `<50k` = NO-GO) is **absolute**, and it was written
+for a 1,600 km city. The `greenwich-pilot` box supports **79,200 images at perfect
+coverage**, so it can never reach the GO line, and a genuinely usable harvest at 60% of
+its own sizing model trips the NO-GO line. The fallback text it prints ("widen to
+Allegheny County") is Pittsburgh boilerplate.
+
+Read the **ratio** instead — `projected_indexable_images / sizing_table_target`:
+
+| ratio | reading |
+|---|---|
+| ≥ 0.75 | healthy; Mapillary coverage supports the sizing model here |
+| 0.40 – 0.75 | usable with holes. Expect misses in whole neighbourhoods, not just on hard images. Record which, for BENCH (§10) |
+| < 0.40 | thin. Widening will not fix it — it buys more thin area. Check `coverage_fraction` and `thinning_ratio` to tell coverage from over-thinning |
+
+`scripts/harvest/greenwich.sh precheck` prints exactly this interpretation after the
+raw report, and exits non-zero on a NO-GO. If the ratio is healthy but the absolute
+verdict is NO-GO, `FORCE=1` proceeds — deliberately, loudly, and worth recording
+wherever BENCH caveats are recorded. `coverage_fraction` below 0.50 is *expected* here:
+with a ~30% water box its ceiling is near 0.70 even with perfect coverage.
+
+### 12.6 The one command sequence
+
+Nothing below runs until a token exists. Getting one is free, instant, and has no
+approval queue: sign in at <https://www.mapillary.com>, open
+<https://www.mapillary.com/dashboard/developers>, register an application with read
+scopes only, copy the **client** token (`MLY|<app_id>|<secret>`). Imagery access is
+**$0** — there is no paid tier to reach.
+
+```bash
+# 0. once
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r services/harvest/requirements.txt
+
+# 1. projected counts and dollar cost — no token, no network, no dependencies
+scripts/harvest/greenwich.sh plan
+
+# 2. the whole runbook, gated on a real coverage measurement
+export MAPILLARY_ACCESS_TOKEN='MLY|...'
+export INFERENCE_SERVICE_URL='https://…'      # B1's Modal endpoint
+export DATABASE_URL='postgres://…'
+scripts/harvest/greenwich.sh all
+```
+
+`all` runs `plan → precheck → confirm → run → stats → embed → load → build_index.sql →
+manifest`, stopping at the confirmation prompt with the real projected counts in front
+of you. Every stage is resumable and idempotent: re-run `all` after an interruption and
+it picks up where it stopped, without duplicating a row or re-embedding one.
+
+Widen by slug — each metro gets its own checkpoint, so they resume independently:
+
+```bash
+METRO=greenwich       scripts/harvest/greenwich.sh all
+METRO=stamford        scripts/harvest/greenwich.sh all
+METRO=fairfield-lower scripts/harvest/greenwich.sh all   # check §12.3 first
+```
+
+Individual stages, for when something needs re-running on its own:
+
+```bash
+scripts/harvest/greenwich.sh precheck | harvest | embed | load | index | stats | manifest
+```
+
+### 12.7 Expected wall-clock, row counts, and cost
+
+Derived from the MASTER_PLAN §3 sizing model and the §9 Pittsburgh anchors, scaled by
+measured street kilometres. **Not measured — nobody has run this against the live API.**
+Replace these with real numbers after the first run.
+
+| Stage | `greenwich-pilot` | `greenwich` | `stamford` | `fairfield-lower` |
+|---|---|---|---|---|
+| `precheck` | <1 min, ~60 req | <1 min, ~60 req | <1 min, ~60 req | ~1 min, ~80 req |
+| `run` (walk) | **2–3 min** | **7–12 min** | **3–5 min** | **43–74 min** |
+| `embed_index` | **1.5–3.0 h** | **5.2–10.4 h** | **2.3–4.5 h** | **23.6–47.2 h** |
+| thumbnails fetched | ~12 GB | ~41 GB | ~18 GB | ~186 GB |
+| `load` | ~1 min | 1–2 min | ~1 min | 3–6 min |
+| `build_index.sql` | **1–4 min** | **4–12 min** | **2–5 min** | **20–50 min** |
+| indexable rows | **79,200** | **275,000** | **118,600** | **1,241,200** |
+| `maintenance_work_mem` needed | **≥138 MB** | **≥479 MB** | **≥206 MB** | **≥2.2 GB** |
+| total in Postgres | 108 MB | 376 MB | 162 MB | 1.7 GB |
+| **Modal L4, one-time** | **$1–2** | **$4–8** | **$2–4** | **$19–38** |
+
+Mapillary imagery and API: **$0**, at every stage. Storage sits inside the existing
+Supabase XL line. **Token to queryable pilot index: about 2–4 hours, ~$2, and all but
+five minutes of it is the GPU.**
+
+The `maintenance_work_mem` row is the one to actually act on. Even the 79k-row pilot
+needs ~138 MB and the Postgres default is **64 MB** — over 2× short. The §6 trap is not
+something only big metros hit; a small index just fails silently faster.
+
+`build_index.sql` rebuilds the HNSW graph over the **whole table**, so adding any
+Greenwich stage means rebuilding Pittsburgh's rows too if they are loaded. Schedule it,
+and watch the 30-minute MASTER_PLAN §3 migration threshold.
+
+### 12.8 Verifying coverage actually landed — before trusting any street-level result
+
+`precision: 'street'` is gated by `assertStreetPrecisionIsEarned()` in the contracts,
+which requires a `vpr-match` in the evidence chain. That assertion is about the *shape*
+of a result. It cannot tell you whether the index behind the match has any imagery on
+the street in question. Do all four of these before letting anyone query the metro.
+
+**1. Density and evenness, not the row count.**
+
+```bash
+python3 services/harvest/harvest.py stats --metro greenwich-pilot
+```
+
+Target is 200 images/km against the box's `street_km` (396 for the pilot), and
+`mean headings/cell` near 4.0. A big row count with `mean headings/cell` under 2.0 is
+single-pass drive-bys: fine for retrieval from the same direction, weak from any other,
+and a real recall limit to record for BENCH. Read §8 for the full interpretation.
+
+**2. Holes, in SQL, per metro.** §8's block query, scoped — Greenwich's box is mostly
+water and backcountry estate lots, so an unscoped hole count is meaningless here:
+
+```sql
+SELECT round(lat/0.005) AS lat_b, round(lon/0.005) AS lon_b, count(*) AS n
+FROM mapillary_images
+WHERE metro = 'greenwich-pilot'
+GROUP BY 1,2 HAVING count(*) < 50
+ORDER BY n;
+```
+
+**3. The manifest, which is what the API will actually read.**
+
+```bash
+scripts/harvest/greenwich.sh manifest
+```
+
+Check `target_attainment` and `embedded_count == image_count`. See §13.
+
+**4. Go outside.** This is the entire reason Greenwich is metro #1 and it is not a
+joke. Stand on a street inside the pilot box, take a photo, run it through the cascade,
+and see whether the returned candidates are the block you are standing on. Ten photos
+across ten different streets — including one deliberately hard one, a hedge-lined
+backcountry road with no signage — will tell you more about this index in twenty
+minutes than any aggregate. Log them as the first BENCH entries (§10). No other metro
+can be checked this way, which is exactly why the numbers above were worth trading away.
+
+---
+
+## 13. Coverage manifest — how the UI earns the right to say "street precision available"
+
+Raven's UI shows "Street precision available" only on results in areas their street
+index actually covers. We need the same honesty, and here it is not a UI decision — it
+is a data question that **cannot currently be answered at all.**
+
+`mapillary_images` carries `metro` and `index_build` on every row (see
+`supabase/migrations/20260729180500_reference_data.sql`), so the API can count rows for
+a metro and prune on `(metro, index_build)` before the ANN order-by. What it cannot do
+is the thing the UI needs: **a metro slug is not a geometry.** Nothing in that schema
+says where `'greenwich'` *is*, so given a lat/lon nothing can decide which metro it
+falls in, or whether any metro covers it at all. The only way to answer it from the
+existing table is `SELECT ... WHERE lat BETWEEN … AND lon BETWEEN …`, which is a
+sequential probe of a multi-million-row table to answer a question about metadata.
+
+Worse, the honest answer is not even "yes/no per metro". Stage 1 covers 1,375 km of
+rectangle at maybe 70% attainment: some blocks inside the box have 400 images and some
+have zero. "Street precision available in Greenwich" is false at the granularity that
+matters. The gate has to be per-block, and it needs a recorded threshold to compare
+against.
+
+So the harvest must record a **coverage manifest row per (metro, index_build)**.
+`scripts/harvest/greenwich.sh manifest` emits exactly this, straight from the
+checkpoint, to `data/harvest/<metro>.coverage.json` — no Postgres and no extra harvest
+pass. The row shape is built by `coverage_manifest_row()` in `services/harvest/metros.py`,
+which is the authoritative definition.
+
+### 13.1 What a coverage-manifest row contains
+
+| Field | Type | Why it is in the row |
+|---|---|---|
+| `manifest_version` | int | Lets a consumer refuse a shape it does not understand instead of misreading one |
+| **`metro`** | text | Joins to `mapillary_images.metro`. The submap key retrieval prunes on |
+| **`index_build`** | text | Joins to `mapillary_images.index_build`, e.g. `mapillary-greenwich-pilot@2026-08-01`. Copied into every `ResultProvenance.indexBuild`; reproducibility is a Daubert requirement |
+| `display_name` | text | What the UI is allowed to call this area |
+| **`min_lon` `min_lat` `max_lon` `max_lat`** | float8 | **The missing geometry.** The entire reason this table exists |
+| `bbox_area_km2` | int | Sanity/reporting |
+| **`image_count`** | int | Rows this harvest kept |
+| **`embedded_count`** | int | Rows with a vector. `image_count − embedded_count > 5%` means the index is partial and `build_index.sql` will refuse |
+| `distinct_cells` | int | With `image_count`, gives mean headings/cell — evenness, not just volume |
+| `street_km` | int | Measured inside the bbox (§12.2) |
+| `images_per_km` | float | Achieved density against the 200/km target |
+| `sizing_target_images` | int | `street_km × 50 × heading_sectors` |
+| **`target_attainment`** | float | `image_count / sizing_target_images`. The single number that says how well this metro is actually covered |
+| `cell_meters` · `heading_sectors` | float · int | Two metros are only comparable at equal grids. A metro harvested at 8 sectors must not be judged against a 4-sector floor |
+| `coverage_fraction` | float | From the pre-check: share of sampled tiles with any imagery |
+| `median_capture_year` | int | Staleness. Streetscapes change; old imagery quietly costs recall |
+| `precheck_report` | text | Path/URI to the full pre-check JSON, so a disputed result can be traced to the measurement that justified building the index |
+| **`harvested_at`** | timestamptz | Harvest date. "This index is from 2026-08" is a caveat a report has to be able to state |
+| `source` | text | `'mapillary'`. There will be other sources; there will never be a GSV-derived one |
+| `attribution_required` | bool | Mapillary ToS §11 attribution is mandatory wherever these images surface — `services/harvest/attribution.ts` |
+| `bbox_source` | text | Provenance of the bbox and `street_km`, verbatim from `metros.py` |
+| **`min_images_for_street_precision`** | int | Default 50 — the per-block floor. In the row, not a constant in the API, because it is a property of how this metro was harvested |
+| `hole_block_degrees` | float8 | Default 0.005 (~550 m). Same block size as the §8 hole query; one definition of "covered", not two |
+
+### 13.2 The table A2 needs to ship
+
+Not written by this agent — `supabase/migrations/` is A2's. This is the shape the
+harvest is already producing.
+
+```sql
+create table public.mapillary_coverage (
+  metro            text not null,
+  index_build      text not null,
+  primary key (metro, index_build),
+
+  display_name     text not null,
+
+  -- The geometry mapillary_images does not have.
+  min_lon          double precision not null,
+  min_lat          double precision not null,
+  max_lon          double precision not null,
+  max_lat          double precision not null,
+  bbox_area_km2    integer,
+
+  image_count      integer not null check (image_count >= 0),
+  embedded_count   integer not null check (embedded_count >= 0),
+  distinct_cells   integer,
+  street_km        integer,
+  sizing_target_images integer,
+  target_attainment    double precision,
+
+  cell_meters      double precision not null,
+  heading_sectors  integer not null,
+
+  coverage_fraction    double precision,
+  median_capture_year  integer,
+  precheck_report      text,
+
+  harvested_at     timestamptz not null,
+  source           text not null default 'mapillary',
+  attribution_required boolean not null default true,
+  bbox_source      text,
+
+  min_images_for_street_precision integer not null default 50,
+  hole_block_degrees              double precision not null default 0.005,
+
+  manifest_version integer not null default 1,
+
+  constraint mapillary_coverage_bbox_ordered
+    check (min_lon < max_lon and min_lat < max_lat),
+  -- An index the UI advertises but has not embedded is worse than no index: retrieval
+  -- succeeds and silently cannot see most of the metro.
+  constraint mapillary_coverage_embedded_le_total
+    check (embedded_count <= image_count)
+);
+
+create index mapillary_coverage_bbox_idx
+  on public.mapillary_coverage (min_lat, max_lat, min_lon, max_lon);
+```
+
+Same posture as `mapillary_images`: global reference data, readable by every
+authenticated user, writable only by the service role, no tenant scoping, no customer
+data.
+
+### 13.3 The question the API answers with it
+
+```sql
+-- Which indexes claim to cover this point, and are they worth believing?
+SELECT metro, index_build, display_name, target_attainment, harvested_at
+FROM mapillary_coverage
+WHERE $lat BETWEEN min_lat AND max_lat
+  AND $lon BETWEEN min_lon AND max_lon;
+```
+
+Then, and only then, the per-block gate — a bbox hit is a *claim*, not coverage:
+
+```sql
+-- Does the specific block have enough imagery to support a street-precision claim?
+SELECT count(*) >= c.min_images_for_street_precision
+FROM mapillary_coverage c
+JOIN mapillary_images m
+  ON m.metro = c.metro AND m.index_build = c.index_build
+WHERE c.metro = $metro
+  AND m.embedding IS NOT NULL
+  AND m.lat BETWEEN $lat - c.hole_block_degrees AND $lat + c.hole_block_degrees
+  AND m.lon BETWEEN $lon - c.hole_block_degrees AND $lon + c.hole_block_degrees;
+```
+
+Three rules that fall out of this, all of which the UI has to honour:
+
+1. **A bbox hit alone never earns "street precision available."** It earns "a street
+   index claims this area." Only the block-level count above earns the badge. Skipping
+   the second query is how you ship a UI that promises street precision over the Long
+   Island Sound tiles in the Greenwich box.
+2. **Coverage is a UNION of rows, never a single metro.** Stage 2 is `greenwich` +
+   `stamford` as two disjoint boxes; stage 3 is a superset whose already-loaded rows
+   keep their older `metro` labels (§12.1, §12.3). So retrieval prunes on
+   `metro = ANY($1)` — the list returned by the first query — not `metro = $1`. A
+   `metro = 'fairfield-lower'` query after staging would be blind to every row loaded
+   as `greenwich`, return plausible neighbours from 20 km away, and look fine.
+3. **No manifest row ⇒ no street precision, full stop.** Not "probably fine", not "we
+   have a Greenwich index so Connecticut is covered." A missing row is the honest
+   answer `precision: 'region'` and the refusal path the contracts already require.
+
+`target_attainment`, `median_capture_year` and `harvested_at` are what turn the badge
+into a sentence a report can defend: *"street-level match against the Mapillary
+Greenwich index, build `mapillary-greenwich-pilot@2026-08-01`, harvested 2026-08-01,
+77% of modelled density, median capture year 2023."* That is a `verifiable` string in
+the sense `Evidence` requires. "Street precision available" on its own is not.

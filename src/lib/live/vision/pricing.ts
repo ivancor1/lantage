@@ -87,6 +87,8 @@ export interface TokenCounts {
   inputTokens?: number;
   outputTokens?: number;
   cachedInputTokens?: number;
+  /** Reported separately by some vendors but already counted inside `outputTokens`. */
+  reasoningTokens?: number;
 }
 
 /**
@@ -107,6 +109,7 @@ export function usageFor(args: {
     ...(tokens.inputTokens === undefined ? {} : { inputTokens: tokens.inputTokens }),
     ...(tokens.outputTokens === undefined ? {} : { outputTokens: tokens.outputTokens }),
     ...(tokens.cachedInputTokens === undefined ? {} : { cachedInputTokens: tokens.cachedInputTokens }),
+    ...(tokens.reasoningTokens === undefined ? {} : { reasoningTokens: tokens.reasoningTokens }),
     costBasis: '',
   };
 
@@ -140,10 +143,16 @@ export function usageFor(args: {
     (cached / 1_000_000) * cachedRate +
     ((tokens.outputTokens ?? 0) / 1_000_000) * price.outputPerMTok;
 
+  // Reasoning tokens are billed as output and are already inside `outputTokens`;
+  // naming them here keeps a reader from double-counting them, and makes an
+  // expensive extraction legible as "it thought", not "it wrote a lot".
+  const reasoning =
+    tokens.reasoningTokens ? ` ${tokens.reasoningTokens} of the output tokens were hidden reasoning.` : '';
+
   return {
     ...counts,
     costUsd,
-    costBasis: `${tokens.inputTokens ?? 0} input + ${tokens.outputTokens ?? 0} output tokens at ${price.inputPerMTok}/${price.outputPerMTok} USD per MTok (${price.source}).`,
+    costBasis: `${tokens.inputTokens ?? 0} input + ${tokens.outputTokens ?? 0} output tokens at ${price.inputPerMTok}/${price.outputPerMTok} USD per MTok (${price.source}).${reasoning}`,
   };
 }
 

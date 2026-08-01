@@ -16,6 +16,12 @@ Three things about this pipeline that are not obvious
 1. `/images?bbox=` HAS NO PAGINATION (only `creator_username` queries do) and caps
    at 2000 rows. A tile at the cap is silently truncated. Every area walk therefore
    subdivides on truncation — see `walk_tile`. This is the correctness core.
+   There are TWO reasons to subdivide, not one. The second is `AreaTooDense`: a
+   dense enough bbox is refused outright with an HTTP 500 whose body says "Please
+   reduce the amount of data you're asking for". It is not retryable and it is not
+   a server fault; it means the box is too big for what is inside it. Both reasons
+   land in the same place — split into quadrants and recurse — but the dense one
+   arrives INSTEAD of rows, so it must subdivide having received nothing.
 
 2. Thinning is the point, not an optimisation. Mapillary density follows
    contributor sequences, so raw coverage is 1 m apart along a few popular corridors
@@ -53,11 +59,13 @@ if str(_HERE) not in sys.path:
 from mapillary_api import (  # noqa: E402
     IMAGE_FIELDS,
     SEARCH_RESULT_CAP,
+    AreaTooDense,
     Bbox,
     MapillaryClient,
     MapillaryError,
     thumb_host_allowed,
 )
+from metros import METRO_SPECS, PROJECTION_DEFAULTS, contains_bbox  # noqa: E402
 
 log = logging.getLogger("harvest")
 
@@ -81,30 +89,21 @@ class Metro:
     note: str = ""
 
 
+# Bboxes, measured street kilometres and provenance live in metros.py — a
+# stdlib-only module so `scripts/harvest/*.sh` can print projected row counts and
+# dollar cost in a confirmation prompt before `pip install` has been run. Metro #1 is
+# Greenwich CT (the operator lives there, so ground truth is a walk, not a project);
+# Pittsburgh remains fully defined as metro #2.
 METROS: Dict[str, Metro] = {
-    # Pittsburgh city limits. Verified against the city boundary extent; the
-    # rectangle necessarily includes river surface and slivers of neighbouring
-    # boroughs, which is fine — empty tiles cost one cheap request each.
-    "pittsburgh": Metro(
-        slug="pittsburgh",
-        name="Pittsburgh, PA (city)",
-        bbox=Bbox(-80.0958, 40.3617, -79.8657, 40.5011),
-        street_km=1600,
-        area_km2=151,
-        note="Metro #1. ~1,600 km of city streets => ~320k images at practical density.",
-    ),
-    # Documented fallback if city-proper community coverage turns out thin.
-    # Stage it: city -> inner ring -> full county. The full county at 200 img/km is
-    # ~1.8M vectors, which is at the ≤2M/metro ceiling in MASTER_PLAN §3, so do not
-    # harvest it in one shot without re-reading that section.
-    "allegheny": Metro(
-        slug="allegheny",
-        name="Allegheny County, PA",
-        bbox=Bbox(-80.3700, 40.1900, -79.6900, 40.6800),
-        street_km=9000,
-        area_km2=1891,
-        note="FALLBACK ONLY. ~1.8M images at practical density — at the pgvector/metro ceiling.",
-    ),
+    spec.slug: Metro(
+        slug=spec.slug,
+        name=spec.name,
+        bbox=Bbox(*spec.bbox),
+        street_km=spec.street_km,
+        area_km2=spec.area_km2,
+        note=spec.note,
+    )
+    for spec in METRO_SPECS.values()
 }
 
 
@@ -123,9 +122,29 @@ DEFAULT_HEADING_SECTORS = 4  # 4 x 90 deg sectors == "4 headings". 8 doubles the
 DEFAULT_TILE_DEG = 0.009
 
 # 0.009 / 2^6 ≈ 0.00014 deg ≈ 15 m. 2000 images inside 15 m is not a real place, so
-# a tile still truncating at this depth is a bug or an API change, and we say so
-# loudly rather than silently dropping coverage.
+# a tile still truncating — or still being refused as too dense — at this depth is a
+# bug or an API change, and we say so loudly rather than silently dropping coverage.
+# Downtown Greenwich, the densest box measured so far, clears at depth 1.
 MAX_SUBDIVIDE_DEPTH = 6
+
+#: Why a tile was split, recorded per tile in the checkpoint. Kept apart because they
+#: mean different things when you are auditing coverage: `row_cap` means we saw 2000
+#: rows and there were probably more, `area_too_dense` means we saw NOTHING and the
+#: whole box's contents arrived only via its children.
+SPLIT_ROW_CAP = "row_cap"
+SPLIT_AREA_TOO_DENSE = "area_too_dense"
+
+# metros.py mirrors the three constants above so its projection maths runs without
+# importing this module (it has no third-party dependencies; this module needs httpx).
+# If they ever drift, every projected row count, tile count and dollar figure the
+# operator is shown at a confirmation prompt silently stops describing the harvest that
+# actually runs — so fail at import rather than at the end of a GPU day.
+if PROJECTION_DEFAULTS != (DEFAULT_CELL_METERS, DEFAULT_HEADING_SECTORS, DEFAULT_TILE_DEG):
+    raise RuntimeError(
+        "metros.PROJECTION_DEFAULTS %r has drifted from harvest.py's %r. harvest.py is "
+        "authoritative; update metros.py to match."
+        % (PROJECTION_DEFAULTS, (DEFAULT_CELL_METERS, DEFAULT_HEADING_SECTORS, DEFAULT_TILE_DEG))
+    )
 
 #: Fixed so `score` is reproducible across runs (a wall-clock normaliser would make
 #: yesterday's winners differ from today's for identical inputs).
@@ -440,14 +459,29 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- Only COMPLETED tiles are recorded. A parent is written after all four children
 -- finish, so an interrupted subtree simply re-descends and its done children are
--- skipped. That is what makes resume both correct and cheap.
+-- skipped. That is what makes resume both correct and cheap. A tile split because
+-- the API refused it as too dense is recorded exactly the same way, so a resume
+-- does not re-issue the request that is guaranteed to fail again.
 CREATE TABLE IF NOT EXISTS tiles (
-  key         TEXT PRIMARY KEY,
-  depth       INTEGER NOT NULL,
-  raw         INTEGER NOT NULL,
-  truncated   INTEGER NOT NULL,
-  is_leaf     INTEGER NOT NULL,
-  finished_at TEXT NOT NULL
+  key          TEXT PRIMARY KEY,
+  depth        INTEGER NOT NULL,
+  raw          INTEGER NOT NULL,
+  truncated    INTEGER NOT NULL,
+  is_leaf      INTEGER NOT NULL,
+  finished_at  TEXT NOT NULL,
+  split_reason TEXT            -- NULL for leaves; 'row_cap' | 'area_too_dense'
+);
+
+-- Boxes we know we did NOT fully enumerate. Written when subdivision runs out of
+-- depth, so an incomplete area survives in the checkpoint instead of only in a log
+-- line that scrolled past. `stats` prints these; an empty table is the claim that
+-- the walk was complete, and that claim has to be checkable after the fact.
+CREATE TABLE IF NOT EXISTS coverage_gaps (
+  key      TEXT PRIMARY KEY,
+  depth    INTEGER NOT NULL,
+  reason   TEXT NOT NULL,
+  detail   TEXT,
+  noted_at TEXT NOT NULL
 );
 
 -- Every id ever considered. Gives idempotent dedupe across overlapping tiles and
@@ -497,7 +531,20 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
+        self._migrate()
         self.db.commit()
+
+    def _migrate(self) -> None:
+        """Additive-only column adds for checkpoints written by an older build.
+
+        A Pittsburgh checkpoint predating `split_reason` is still perfectly valid —
+        its tiles are done and its records are real — so it is migrated rather than
+        rejected. `CREATE TABLE IF NOT EXISTS` will not add a column to a table that
+        already exists, which is why this exists at all.
+        """
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(tiles)")}
+        if "split_reason" not in have:
+            self.db.execute("ALTER TABLE tiles ADD COLUMN split_reason TEXT")
 
     def close(self) -> None:
         self.db.commit()
@@ -538,10 +585,18 @@ class Store:
             self.db.execute("SELECT 1 FROM tiles WHERE key = ?", (key,)).fetchone() is not None
         )
 
-    def mark_tile(self, key: str, depth: int, raw: int, truncated: bool, is_leaf: bool) -> None:
+    def mark_tile(
+        self,
+        key: str,
+        depth: int,
+        raw: int,
+        truncated: bool,
+        is_leaf: bool,
+        split_reason: Optional[str] = None,
+    ) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO tiles(key, depth, raw, truncated, is_leaf, finished_at) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO tiles(key, depth, raw, truncated, is_leaf, finished_at, "
+            "split_reason) VALUES(?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 depth,
@@ -549,8 +604,21 @@ class Store:
                 1 if truncated else 0,
                 1 if is_leaf else 0,
                 datetime.now(timezone.utc).isoformat(),
+                split_reason,
             ),
         )
+
+    def note_gap(self, key: str, depth: int, reason: str, detail: str = "") -> None:
+        """Record a box we could not fully enumerate. Never silently dropped."""
+        self.db.execute(
+            "INSERT OR REPLACE INTO coverage_gaps(key, depth, reason, detail, noted_at) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (key, depth, reason, detail[:400], datetime.now(timezone.utc).isoformat()),
+        )
+
+    def clear_gap(self, key: str) -> None:
+        """A box that enumerated cleanly on a later attempt is no longer a gap."""
+        self.db.execute("DELETE FROM coverage_gaps WHERE key = ?", (key,))
 
     # -- candidates ---------------------------------------------------------
 
@@ -649,6 +717,25 @@ class Store:
     def discard_counts(self) -> Dict[str, int]:
         return {r["reason"]: r["n"] for r in self.db.execute("SELECT reason, n FROM discards")}
 
+    def split_counts(self) -> Dict[str, int]:
+        """-> {'area_too_dense': n, 'row_cap': n} over non-leaf tiles."""
+        return {
+            r["split_reason"]: r["c"]
+            for r in self.db.execute(
+                "SELECT split_reason, COUNT(*) AS c FROM tiles "
+                "WHERE is_leaf = 0 AND split_reason IS NOT NULL GROUP BY split_reason"
+            )
+        }
+
+    def gaps(self) -> List[sqlite3.Row]:
+        return list(
+            self.db.execute("SELECT * FROM coverage_gaps ORDER BY reason, key")
+        )
+
+    def max_depth_reached(self) -> int:
+        row = self.db.execute("SELECT MAX(depth) AS d FROM tiles").fetchone()
+        return int(row["d"] or 0)
+
     def iter_records(self, only_unembedded: bool = False) -> Iterator[sqlite3.Row]:
         sql = "SELECT * FROM records"
         if only_unembedded:
@@ -679,6 +766,15 @@ class Progress:
     raw_seen: int = 0
     kept: int = 0
     replaced: int = 0
+    #: Subdivisions, counted by reason. Two very different stories: `cap_splits` is
+    #: "we saw 2000 and suspect more", `dense_splits` is "we saw nothing and had to
+    #: shrink to see anything at all". A run reporting only the second is a run
+    #: against a dense downtown, which is exactly where the old code collected zero.
+    cap_splits: int = 0
+    dense_splits: int = 0
+    #: Boxes abandoned at max depth. Non-zero means the index has known holes.
+    cap_gaps: int = 0
+    dense_gaps: int = 0
     discards: Dict[str, int] = field(default_factory=dict)
 
     def add_discards(self, counters: Dict[str, int]) -> None:
@@ -700,6 +796,9 @@ class Progress:
         return {
             "root_tiles": "%d/%d" % (self.root_tiles, self.total_root_tiles),
             "leaf_tiles": self.leaf_tiles,
+            "split_for_density": self.dense_splits,
+            "split_for_row_cap": self.cap_splits,
+            "coverage_gaps": self.cap_gaps + self.dense_gaps,
             "raw_seen": self.raw_seen,
             "kept": self.kept,
             "replaced": self.replaced,
@@ -760,30 +859,96 @@ class Harvester:
         self.stop = False
 
     async def walk_tile(self, tile: Bbox, depth: int = 0) -> None:
-        """Fetch a tile; subdivide on cap-truncation.
+        """Fetch a tile; subdivide on cap-truncation OR on a density refusal.
 
         Truncation detection is the whole reason this is recursive. `/images?bbox=`
         returns at most 2000 rows with no cursor, so `len(rows) == limit` is
         indistinguishable from "there are 40,000 here" — except by shrinking the box.
+
+        `AreaTooDense` is the same problem one step earlier: the box is dense enough
+        that the API declines to answer at all. It reaches the identical remedy from
+        the opposite direction — truncation subdivides holding 2000 rows, density
+        subdivides holding none — so it must not be routed through the failure path,
+        which would leave the densest blocks in the metro unharvested.
         """
         key = tile.to_param()
         if self.stop or self.store.tile_done(key):
             return
 
+        too_dense = False
+        dense_detail = ""
+        rows: List[Dict[str, Any]] = []
+        truncated = False
         async with self.sem:
             try:
                 rows, truncated = await self.client.search_images(tile, fields=IMAGE_FIELDS)
+            except AreaTooDense as exc:
+                # Deliberately not retried and not backed off: this 500 is a function
+                # of the bbox, so the identical request has an identical outcome. The
+                # retry budget is spent on smaller boxes instead, which is the only
+                # thing that can work. Recursion happens outside the semaphore so a
+                # dense subtree does not hold a slot for its whole descent.
+                too_dense = True
+                dense_detail = exc.body[:200]
             except MapillaryError as exc:
                 # Leave the tile unmarked so the next run retries exactly this box.
                 emit("tile_failed", tile=key, depth=depth, status=exc.status, error=str(exc))
                 return
 
-        if truncated and depth < MAX_SUBDIVIDE_DEPTH:
-            emit("tile_truncated", tile=key, depth=depth, rows=len(rows), action="subdivide")
+        if too_dense and depth < MAX_SUBDIVIDE_DEPTH:
+            emit(
+                "tile_too_dense",
+                tile=key,
+                depth=depth,
+                action="subdivide",
+                note="API refused the bbox for data volume; splitting into quadrants",
+            )
+            self.progress.dense_splits += 1
             for quad in tile.quadrants():
                 await self.walk_tile(quad, depth + 1)
             async with self.db_lock:
-                self.store.mark_tile(key, depth, len(rows), True, is_leaf=False)
+                # raw=0 because this box itself returned nothing — everything under it
+                # came from its children. Recording it is what stops a resume from
+                # re-issuing a request we already know the API refuses.
+                self.store.mark_tile(
+                    key, depth, 0, truncated=False, is_leaf=False,
+                    split_reason=SPLIT_AREA_TOO_DENSE,
+                )
+                self.store.clear_gap(key)
+                self.store.db.commit()
+            return
+
+        if too_dense:
+            # ~15 m across and still refused. Nothing was collected for this box, and
+            # it must not be recorded as done — a hole that resume can retry beats a
+            # hole that looks complete. The gap is persisted, not just logged.
+            emit(
+                "tile_too_dense_at_max_depth",
+                tile=key,
+                depth=depth,
+                severity="error",
+                error=dense_detail,
+                note=(
+                    "NO IMAGERY COLLECTED for this bbox — the API refused it as too "
+                    "dense at maximum subdivision depth. Coverage here is INCOMPLETE; "
+                    "the box is recorded in coverage_gaps and `stats` prints it."
+                ),
+            )
+            self.progress.dense_gaps += 1
+            async with self.db_lock:
+                self.store.note_gap(key, depth, SPLIT_AREA_TOO_DENSE, dense_detail)
+                self.store.db.commit()
+            return
+
+        if truncated and depth < MAX_SUBDIVIDE_DEPTH:
+            emit("tile_truncated", tile=key, depth=depth, rows=len(rows), action="subdivide")
+            self.progress.cap_splits += 1
+            for quad in tile.quadrants():
+                await self.walk_tile(quad, depth + 1)
+            async with self.db_lock:
+                self.store.mark_tile(
+                    key, depth, len(rows), True, is_leaf=False, split_reason=SPLIT_ROW_CAP
+                )
                 self.store.db.commit()
             return
 
@@ -798,6 +963,12 @@ class Harvester:
                 severity="error",
                 note="coverage here is INCOMPLETE — investigate before trusting the index",
             )
+            self.progress.cap_gaps += 1
+            async with self.db_lock:
+                self.store.note_gap(
+                    key, depth, SPLIT_ROW_CAP, "returned %d rows at the cap" % len(rows)
+                )
+                self.store.db.commit()
 
         counters: Dict[str, int] = {}
         kept = replaced = 0
@@ -829,6 +1000,10 @@ class Harvester:
         async with self.db_lock:
             self.store.bump_discards(counters)
             self.store.mark_tile(key, depth, len(rows), truncated, is_leaf=True)
+            if not truncated:
+                # A box that enumerated cleanly is no longer a gap, however it was
+                # recorded on an earlier run. `--retry-gaps` depends on this.
+                self.store.clear_gap(key)
             self.store.db.commit()
 
         self.progress.leaf_tiles += 1
@@ -836,6 +1011,32 @@ class Harvester:
         self.progress.kept += kept
         self.progress.replaced += replaced
         self.progress.add_discards(counters)
+
+    async def retry_gaps(self) -> int:
+        """Re-walk only the boxes recorded as never fully enumerated.
+
+        A normal resume cannot reach these. Their parents were legitimately marked
+        done — the walk really did descend as far as the algorithm goes — so the
+        early-out in `walk_tile` prunes the whole subtree above them. Retrying them
+        directly is the honest alternative to either re-walking a metro to reach four
+        tiny boxes, or pretending the holes are not there.
+        """
+        gaps = self.store.gaps()
+        if not gaps:
+            emit("retry_gaps", gaps=0, note="nothing recorded as incomplete")
+            return 0
+        emit("retry_gaps_start", gaps=len(gaps))
+        for g in gaps:
+            await self.walk_tile(Bbox.parse(g["key"]), int(g["depth"]))
+        remaining = len(self.store.gaps())
+        emit(
+            "retry_gaps_done",
+            attempted=len(gaps),
+            closed=len(gaps) - remaining,
+            remaining=remaining,
+            severity="error" if remaining else "info",
+        )
+        return remaining
 
     async def run(self, tiles: Sequence[Bbox]) -> None:
         self.progress = Progress(total_root_tiles=len(tiles))
@@ -859,17 +1060,35 @@ class Harvester:
             self.progress.root_tiles = idx
             if idx % self.progress_every == 0 or idx == len(tiles):
                 emit("progress", **self.progress.snapshot(self.client.budget_line()))
+        splits = self.store.split_counts()
+        gaps = self.store.gaps()
         emit(
             "harvest_done",
             kept_total=self.store.kept_count(),
             considered_total=self.store.seen_count(),
             leaf_tiles_total=self.store.tiles_done_count(),
+            tiles_split_for_density=splits.get(SPLIT_AREA_TOO_DENSE, 0),
+            tiles_split_for_row_cap=splits.get(SPLIT_ROW_CAP, 0),
+            max_depth_reached=self.store.max_depth_reached(),
+            coverage_gaps=len(gaps),
             discards=self.store.discard_counts(),
             api_requests=self.client.stats.requests,
             api_retries=self.client.stats.retries,
             api_rate_limited=self.client.stats.rate_limited,
+            api_area_too_dense=self.client.stats.area_too_dense,
             api_mb_in=round(self.client.stats.bytes_in / 1e6, 1),
         )
+        if gaps:
+            # Repeated at severity error at the very end of the run: a mid-run event
+            # scrolls past, and an operator who reads only the last line still has to
+            # learn that this index has holes.
+            emit(
+                "coverage_incomplete",
+                severity="error",
+                gaps=len(gaps),
+                boxes=[g["key"] for g in gaps[:20]],
+                note="these bboxes were NOT fully enumerated — see `stats` for the list",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +1108,71 @@ def sample_tiles(bbox: Bbox, tile_deg: float, n: int) -> List[Bbox]:
         return all_tiles
     stride = len(all_tiles) / float(n)
     return [all_tiles[min(len(all_tiles) - 1, int(i * stride))] for i in range(n)]
+
+
+#: Verdict bands, expressed as `projected_indexable / sizing_table_target` — how much
+#: of what THIS bbox could support at the MASTER_PLAN §3 practical density actually
+#: exists in Mapillary. A ratio, not a count, because the question "is there enough
+#: imagery here to match against" is about density along the streets in the box; a
+#: count answers a different question (does this deserve to be called a metro index)
+#: and is reported separately as context. The same bands are printed by
+#: `scripts/harvest/greenwich.sh` and documented in docs/HARVEST.md §12.5.
+ATTAINMENT_HEALTHY = 0.75
+ATTAINMENT_USABLE = 0.40
+
+#: Purely contextual. Below this an index is small enough that its own coverage, not
+#: its size, is what to reason about — it never decides the verdict.
+METRO_SCALE_IMAGES = 100_000
+
+
+def wider_metro_suggestion(metro: Metro) -> Optional[Metro]:
+    """The smallest registered metro that strictly contains this bbox, if any.
+
+    The old fallback text named Allegheny County unconditionally, which is wrong
+    advice for every search that is not Pittsburgh — and actively misleading for a
+    Connecticut bbox. Derive the suggestion from the registry instead, and say
+    plainly when there is nothing to suggest.
+    """
+    here = (metro.bbox.min_lon, metro.bbox.min_lat, metro.bbox.max_lon, metro.bbox.max_lat)
+    wider = [
+        other
+        for other in METROS.values()
+        if other.slug != metro.slug
+        and other.street_km > metro.street_km
+        and contains_bbox(
+            (other.bbox.min_lon, other.bbox.min_lat, other.bbox.max_lon, other.bbox.max_lat),
+            here,
+        )
+    ]
+    return min(wider, key=lambda m: m.street_km) if wider else None
+
+
+async def sample_tile_rows(
+    client: MapillaryClient, tile: Bbox, depth: int = 0
+) -> Tuple[List[Dict[str, Any]], bool, int]:
+    """Rows for one sampled tile -> (rows, truncated, dense_subdivisions).
+
+    Mirrors `walk_tile`'s density handling on purpose. If the pre-check let an
+    `AreaTooDense` tile fall through to the failure path, the sample would silently
+    exclude the densest tiles in the metro — and the projection built from it would
+    understate coverage worst exactly where coverage is best. That is how downtown
+    Greenwich measured as a NO-GO.
+    """
+    try:
+        rows, truncated = await client.search_images(tile, fields=IMAGE_FIELDS)
+        return rows, truncated, 0
+    except AreaTooDense:
+        if depth >= MAX_SUBDIVIDE_DEPTH:
+            raise
+        out: List[Dict[str, Any]] = []
+        trunc = False
+        splits = 1
+        for quad in tile.quadrants():
+            r, t, s = await sample_tile_rows(client, quad, depth + 1)
+            out.extend(r)
+            trunc = trunc or t
+            splits += s
+        return out, trunc, splits
 
 
 async def precheck(
@@ -1186,9 +1470,19 @@ def cmd_stats(store: Store, metro: Metro, params: HarvestParams) -> None:
     )
     w = sys.stdout.write
     w("\n%s — harvest state\n" % metro.name)
+    splits = store.split_counts()
+    gaps = store.gaps()
     w("  db                     %s\n" % store.path)
     w("  index_build            %s\n" % (store.get_meta("index_build") or "(not pinned yet)"))
     w("  leaf tiles complete    %d (root grid %d)\n" % (tiles, total_tiles))
+    w(
+        "  tiles subdivided       %d for density, %d for the 2000-row cap (max depth %d)\n"
+        % (
+            splits.get(SPLIT_AREA_TOO_DENSE, 0),
+            splits.get(SPLIT_ROW_CAP, 0),
+            store.max_depth_reached(),
+        )
+    )
     w("  indexable records      %s\n" % f"{kept:,}")
     w("    with SfM geometry    %s (%s)\n" % (f"{computed:,}", _pct(computed / kept if kept else None)))
     w("    panoramas            %s\n" % f"{pano:,}")
@@ -1209,6 +1503,23 @@ def cmd_stats(store: Store, metro: Metro, params: HarvestParams) -> None:
         store.db.execute("SELECT COUNT(DISTINCT cell_key) AS c FROM records").fetchone()["c"]
     )
     w("  distinct grid cells    %s (mean %.2f headings/cell)\n" % (f"{cells:,}", kept / cells if cells else 0))
+    # Printed last and unmissably, because this is the number that decides whether the
+    # row count above describes the whole box or only the parts of it that answered.
+    if gaps:
+        w(
+            "\n  !! COVERAGE INCOMPLETE — %d bbox(es) were never fully enumerated.\n"
+            % len(gaps)
+        )
+        for g in gaps[:20]:
+            w("     %s  depth %d  %s\n" % (g["key"], g["depth"], g["reason"]))
+        if len(gaps) > 20:
+            w("     ... and %d more (SELECT * FROM coverage_gaps)\n" % (len(gaps) - 20))
+        w(
+            "     A plain resume will NOT revisit these — their parents completed.\n"
+            "     Retry exactly these boxes with: harvest.py run --retry-gaps\n"
+        )
+    else:
+        w("  coverage gaps          none — every tile enumerated to completion\n")
     w("\n")
 
 
@@ -1390,6 +1701,13 @@ def build_parser() -> argparse.ArgumentParser:
     rn.add_argument("--max-records", type=int, default=None, dest="max_records")
     rn.add_argument("--progress-every", type=int, default=10, dest="progress_every")
     rn.add_argument("--reset", action="store_true", help="delete the checkpoint and start over")
+    rn.add_argument(
+        "--retry-gaps",
+        action="store_true",
+        dest="retry_gaps",
+        help="re-walk only the bboxes recorded in coverage_gaps, then stop. A plain "
+             "resume cannot reach them: their parents legitimately completed.",
+    )
 
     st = sub.add_parser("stats", help="report harvest state and coverage density")
     add_common(st)
@@ -1450,7 +1768,11 @@ async def _async_main(args: argparse.Namespace, metro: Metro, params: HarvestPar
                 concurrency=args.concurrency,
                 progress_every=args.progress_every,
             )
-            await harvester.run(tiles)
+            if getattr(args, "retry_gaps", False):
+                harvester.progress = Progress(total_root_tiles=0)
+                await harvester.retry_gaps()
+            else:
+                await harvester.run(tiles)
         cmd_stats(store, metro, params)
     finally:
         store.close()

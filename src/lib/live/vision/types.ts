@@ -68,6 +68,13 @@ export interface VisionUsage {
   outputTokens?: number;
   cachedInputTokens?: number;
   /**
+   * Hidden reasoning tokens, when the vendor reports them. Already INSIDE
+   * `outputTokens` and therefore already paid for — this is not a second charge,
+   * it is the answer to "what did the model spend before writing anything", which
+   * is the number that explains a slow, expensive structured extraction.
+   */
+  reasoningTokens?: number;
+  /**
    * Real cost from real token counts against a published price.
    * ABSENT when the model's price is unknown — see `pricing.ts`. Never guessed.
    */

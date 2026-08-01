@@ -689,3 +689,116 @@ test('the region-coordinate addendum only appears when it is asked for', async (
   });
   assert.ok(!/regionCoordinates/.test(promptOf(without[0])));
 });
+
+// ---------------------------------------------------------------------------
+// Reasoning effort — the largest single latency term on this path
+// ---------------------------------------------------------------------------
+
+/**
+ * Measured 2026-07-31 on a real 2560x1440 frame: the vendor default spent 516
+ * hidden reasoning tokens and 22.4s against 12.4s at `none` for an identical
+ * clue list. LOCATE asks the model to enumerate what is visible against a strict
+ * schema — there is nothing to deduce, so the thinking is pure cost.
+ */
+test('reasoning effort is sent, defaults to none, and is overridable', async () => {
+  const { OpenAiVisionProvider } = (await import(openaiSpecifier)) as typeof OpenAiModule;
+
+  const effortOf = async (provider: InstanceType<typeof OpenAiVisionProvider>): Promise<unknown> => {
+    const captured = await withStubbedFetch(
+      [
+        {
+          model: provider.model,
+          status: 'completed',
+          output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify(cluePayload()) }] }],
+          usage: { input_tokens: 100, output_tokens: 20 },
+        },
+      ],
+      async (requests) => {
+        await provider.extractClues({
+          image: { imageId: 'img_effort', bytes: smallPng(), mimeType: 'image/png' },
+          timeoutMs: 5_000,
+        });
+        return requests;
+      },
+    );
+    return (captured[0].body.reasoning as Record<string, unknown> | undefined)?.effort;
+  };
+
+  assert.equal(await effortOf(new OpenAiVisionProvider({ apiKey: 'k' })), 'none');
+  assert.equal(
+    await effortOf(new OpenAiVisionProvider({ apiKey: 'k', reasoningEffort: 'high' })),
+    'high',
+    'a harder corpus must be able to buy the thinking back',
+  );
+
+  // '' and 'default' mean "send nothing and take the vendor's own default" — the
+  // escape hatch for a model whose supported effort values change under us.
+  assert.equal(await effortOf(new OpenAiVisionProvider({ apiKey: 'k', reasoningEffort: 'default' })), undefined);
+});
+
+test('reasoning effort is withheld from models that reject the parameter', async () => {
+  const { OpenAiVisionProvider, supportsReasoningEffort } = (await import(
+    openaiSpecifier
+  )) as typeof OpenAiModule;
+
+  // gpt-4o answers HTTP 400 "Unsupported parameter: 'reasoning.effort'". A model
+  // override must not turn into a hard failure on a default nobody chose.
+  assert.equal(supportsReasoningEffort('gpt-4o'), false);
+  assert.equal(supportsReasoningEffort('gpt-5.6-luna'), true);
+  assert.equal(supportsReasoningEffort('o3-mini'), true);
+
+  const provider = new OpenAiVisionProvider({ apiKey: 'k', model: 'gpt-4o', reasoningEffort: 'high' });
+  assert.equal(provider.reasoningEffort, undefined);
+
+  const captured = await withStubbedFetch(
+    [
+      {
+        model: 'gpt-4o',
+        status: 'completed',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify(cluePayload()) }] }],
+        usage: { input_tokens: 100, output_tokens: 20 },
+      },
+    ],
+    async (requests) => {
+      await provider.extractClues({
+        image: { imageId: 'img_4o', bytes: smallPng(), mimeType: 'image/png' },
+        timeoutMs: 5_000,
+      });
+      return requests;
+    },
+  );
+  assert.equal(captured[0].body.reasoning, undefined);
+});
+
+test('hidden reasoning tokens are reported without being billed twice', async () => {
+  const { OpenAiVisionProvider } = (await import(openaiSpecifier)) as typeof OpenAiModule;
+  const provider = new OpenAiVisionProvider({ apiKey: 'k', model: 'gpt-5.6-luna' });
+
+  const res = await withStubbedFetch(
+    [
+      {
+        model: 'gpt-5.6-luna',
+        status: 'completed',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify(cluePayload()) }] }],
+        usage: {
+          input_tokens: 4_000,
+          output_tokens: 1_000,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens_details: { reasoning_tokens: 600 },
+        },
+      },
+    ],
+    async () =>
+      provider.extractClues({
+        image: { imageId: 'img_r', bytes: smallPng(), mimeType: 'image/png' },
+        timeoutMs: 5_000,
+      }),
+  );
+
+  assert.ok(res.ok, res.ok ? '' : res.error.reason);
+  assert.equal(res.value.usage.reasoningTokens, 600);
+  // Reasoning tokens sit INSIDE output_tokens. Adding them again would inflate
+  // every cost this module reports on a reasoning model.
+  assert.equal(res.value.usage.costUsd, (4_000 / 1e6) * 1 + (1_000 / 1e6) * 6);
+  assert.match(res.value.usage.costBasis, /600 of the output tokens were hidden reasoning/);
+});

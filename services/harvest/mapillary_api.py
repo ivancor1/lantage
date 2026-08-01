@@ -28,6 +28,29 @@ adaptive subdivision: when a tile comes back at the cap, split it into quadrants
 and re-query. `search_images_adaptive` in harvest.py is the only sanctioned way to
 enumerate an area. Never call `search_images` on a large bbox and trust the count.
 
+THE SECOND REASON TO SUBDIVIDE, MEASURED 2026-07-31
+---------------------------------------------------
+A bbox the server considers too data-heavy is rejected outright:
+
+  HTTP 500  {"error":{"code":1,"message":"Please reduce the amount of data
+             you're asking for, then retry your request"}}
+
+Measured against downtown Greenwich CT with a valid token:
+
+  bbox -73.6310,41.0150,-73.6220,41.0240 (0.009 deg)  limit=50    -> 500
+  same bbox                                            limit=2000  -> 500
+  that bbox's south-west quadrant (0.0045 deg)         limit=2000  -> 200, 1938 rows
+  bbox -73.6280,41.0180,-73.6260,41.0200 (0.002 deg)  limit=50    -> 200, 46 rows
+
+The rejection tracks the volume of data INSIDE the bbox, not `limit` — lowering
+`limit` does not help, and the wording ("reduce the amount of data you're asking
+for") describes the box, not the page size. It is therefore a permanent property
+of that request: retrying it is guaranteed to fail, and a plain 5xx retry loop
+burns its whole budget and collects nothing. `AreaTooDense` exists so callers can
+tell this apart from a genuine server error and respond the only way that works —
+shrink the box. Real 500s and 429s still retry exactly as before, which is why the
+match is on the message text and not on the status alone.
+
 WHY A DIRECT HTTP CLIENT AND NOT mapillary-python-sdk
 -----------------------------------------------------
 The official SDK is an approved API path, but its documented surface is
@@ -108,6 +131,16 @@ ALLOWED_THUMB_HOST_SUFFIXES: Tuple[str, ...] = (
 
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504, 408})
 
+# The exact phrase the Graph API returns (inside a 500) when a bbox holds more data
+# than it will serve. Matched case-insensitively as a substring so a reworded prefix
+# or a changed `code` does not silently turn this back into an infinite retry.
+# Deliberately narrow: anything that does NOT contain it stays an ordinary 5xx and
+# keeps its retries. Re-verify this string if the error handling ever stops firing —
+# a stale match here fails OPEN into the old backoff-forever behaviour.
+DENSITY_REJECTION_MARKERS: Tuple[str, ...] = (
+    "reduce the amount of data",
+)
+
 
 class MapillaryError(RuntimeError):
     """Non-retryable API failure."""
@@ -119,8 +152,48 @@ class MapillaryError(RuntimeError):
         self.url = url
 
 
+class AreaTooDense(MapillaryError):
+    """The bbox holds more imagery than the API will serve in one response.
+
+    NOT a transport error and NOT retryable: the same request produces the same
+    refusal forever, because the cause is how much imagery sits inside the box.
+    The only fix is a smaller box, so callers must treat this as a signal to
+    subdivide — see `walk_tile` in harvest.py. It subclasses MapillaryError so a
+    caller that has not been taught about it still degrades to "tile failed"
+    rather than crashing, but any caller that enumerates an area owes it a
+    dedicated branch: swallowing this is silent under-collection of exactly the
+    densest, most valuable blocks.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        body: str,
+        url: str,
+        bbox_param: Optional[str] = None,
+        bbox: Optional["Bbox"] = None,
+    ) -> None:
+        super().__init__(status, body, url)
+        #: The raw `bbox=` query parameter, always available even from `_get`.
+        self.bbox_param = bbox_param
+        #: The parsed Bbox, attached by `search_images` so callers can subdivide it.
+        self.bbox = bbox
+
+
 class BboxTooLarge(ValueError):
     pass
+
+
+def is_area_too_dense(status: int, body: str) -> bool:
+    """True only for the documented 'reduce the amount of data' 5xx.
+
+    Status alone is not enough — a genuine 500 must keep its retries — so both the
+    5xx class and the message text have to match.
+    """
+    if status < 500:
+        return False
+    low = (body or "").lower()
+    return any(marker in low for marker in DENSITY_REJECTION_MARKERS)
 
 
 def assert_fields_permitted(fields: Iterable[str]) -> None:
@@ -261,6 +334,10 @@ class ClientStats:
     retries: int = 0
     rate_limited: int = 0
     server_errors: int = 0
+    #: Counted separately from `server_errors`: these are not failures, they are
+    #: subdivide signals, and conflating them would make a healthy dense-metro
+    #: harvest look like an unstable API.
+    area_too_dense: int = 0
     bytes_in: int = 0
     seconds_waiting_on_backoff: float = 0.0
     per_status: Dict[int, int] = field(default_factory=dict)
@@ -338,6 +415,20 @@ class MapillaryClient:
                     raise MapillaryError(200, "expected JSON object, got %s" % type(payload), url)
                 return payload
 
+            # Checked BEFORE the retry branch, and on the first attempt: this 500 is
+            # a property of the bbox, so backing off cannot change the answer. Every
+            # second spent retrying it is a second not spent on the smaller box that
+            # would have worked. Raise immediately and let the caller subdivide.
+            if is_area_too_dense(resp.status_code, resp.text):
+                self.stats.area_too_dense += 1
+                log.info(
+                    "area too dense for one response: bbox=%s — caller must subdivide",
+                    params.get("bbox"),
+                )
+                raise AreaTooDense(
+                    resp.status_code, resp.text, url, bbox_param=str(params.get("bbox") or "")
+                )
+
             if resp.status_code in RETRYABLE_STATUS and attempt < self.max_attempts:
                 if resp.status_code == 429:
                     self.stats.rate_limited += 1
@@ -382,6 +473,10 @@ class MapillaryClient:
 
         `truncated` is True when the API returned `limit` rows, meaning there are
         probably more and there is NO cursor to reach them. Callers must subdivide.
+
+        Raises `AreaTooDense` when the server refuses the bbox outright for holding
+        too much data. That is the *other* subdivide signal, and it arrives instead
+        of rows rather than alongside them.
         """
         assert_fields_permitted(fields)
         assert_bbox_within_api_limit(bbox)
@@ -396,7 +491,13 @@ class MapillaryClient:
         if end_captured_at:
             params["end_captured_at"] = end_captured_at
 
-        payload = await self._get("%s/images" % GRAPH_BASE, params, self.search_bucket)
+        try:
+            payload = await self._get("%s/images" % GRAPH_BASE, params, self.search_bucket)
+        except AreaTooDense as exc:
+            # `_get` only ever sees the serialised parameter. Hand the caller the real
+            # Bbox so it can call `.quadrants()` without re-parsing its own request.
+            exc.bbox = bbox
+            raise
         rows = payload.get("data") or []
         if not isinstance(rows, list):
             raise MapillaryError(200, "expected data[] list, got %s" % type(rows), "/images")

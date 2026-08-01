@@ -710,3 +710,105 @@ test('a doc with no prompt-ready section still yields its headings and bullets',
 test('the budget is larger than the cascades, because this module IS the vision call', () => {
   assert.ok(LOCATE_BUDGET_MS > 10_000);
 });
+
+// ---------------------------------------------------------------------------
+// The caller's identifiers and the caller's measurements
+// ---------------------------------------------------------------------------
+
+/**
+ * The orchestrator's LOCATE adapter sends `image`, `upload`, `bytes`, `mime` and
+ * `quality`. It does NOT send `uploadId`, and reading it directly produced
+ * candidate ids like `undefined-region-1` and crop links at
+ * `/api/images/undefined/crop` — a dead evidence trail that raised no error.
+ */
+test('the upload id is taken from whichever field the caller populated', async () => {
+  const run = async (input: Record<string, unknown>): Promise<SearchResult['geo']> => {
+    const result = await locate(
+      { bytes: png(1600, 1200), ...input } as Parameters<typeof locate>[0],
+      {
+        provider: stubProvider({ ok: true, value: { clues: clues() } }),
+        geocoder: stubGeocoder({ Pittsburgh: PITTSBURGH }),
+        readTechniqueDoc: noTechniqueDoc,
+        env: {},
+      },
+    );
+    return result.geo;
+  };
+
+  const direct = await run({ uploadId: 'up_direct' });
+  assert.equal(direct?.[0].id, 'up_direct-region-1');
+
+  const viaUpload = await run({ upload: { id: 'up_record' } });
+  assert.equal(viaUpload?.[0].id, 'up_record-region-1');
+
+  const viaImage = await run({ image: { imageId: 'up_image' } });
+  assert.equal(viaImage?.[0].id, 'up_image-region-1');
+
+  // No id anywhere: a marker a human can search for, never the string 'undefined'.
+  const none = await run({});
+  assert.equal(none?.[0].id, 'unknown-upload-region-1');
+  for (const item of none?.[0].evidence ?? []) {
+    assert.ok(!(item.cropUrl ?? '').includes('undefined'), 'a crop URL must never carry "undefined"');
+  }
+});
+
+test('a caller-supplied quality gate is trusted rather than re-run and re-reported', async () => {
+  const supplied: Contracts.QualityGate = {
+    passed: true,
+    components: { resolutionPx: { w: 1600, h: 1200 } },
+    degraded: false,
+  };
+
+  const withGate = await locate(
+    { uploadId: 'up_gate', bytes: png(1600, 1200), quality: supplied },
+    {
+      provider: stubProvider({ ok: true, value: { clues: clues() } }),
+      geocoder: stubGeocoder({ Pittsburgh: PITTSBURGH }),
+      readTechniqueDoc: noTechniqueDoc,
+      env: {},
+    },
+  );
+
+  // The orchestrator already emitted both; a second copy of each is noise in the
+  // trace a reader uses to see what actually ran.
+  assert.equal(withGate.stages.some((s) => s.stage === 'preprocess'), false);
+  assert.equal(withGate.stages.some((s) => s.stage === 'quality-gate'), false);
+  assert.equal(withGate.quality, supplied, 'the caller\'s verdict is the one reported back');
+  assert.equal(withGate.geo.length, 1, 'suppressing the traces must not suppress the work');
+
+  const standalone = await locate(
+    { uploadId: 'up_gate_2', bytes: png(1600, 1200) },
+    {
+      provider: stubProvider({ ok: true, value: { clues: clues() } }),
+      geocoder: stubGeocoder({ Pittsburgh: PITTSBURGH }),
+      readTechniqueDoc: noTechniqueDoc,
+      env: {},
+    },
+  );
+  assert.equal(standalone.stages.some((s) => s.stage === 'preprocess'), true);
+  assert.equal(standalone.stages.some((s) => s.stage === 'quality-gate'), true);
+});
+
+test('a caller-supplied refusal still returns no ranking', async () => {
+  const result = await locate(
+    {
+      uploadId: 'up_refused',
+      bytes: png(1600, 1200),
+      quality: {
+        passed: false,
+        components: { resolutionPx: { w: 120, h: 90 } },
+        degraded: false,
+        refusalReason: 'Resolution is 120x90.',
+      },
+    },
+    {
+      provider: stubProvider({ ok: true, value: { clues: clues() } }),
+      geocoder: stubGeocoder({ Pittsburgh: PITTSBURGH }),
+      readTechniqueDoc: noTechniqueDoc,
+      env: {},
+    },
+  );
+
+  assert.equal(result.geo.length, 0);
+  assert.equal(result.stages.some((s) => s.stage === 'vlm-clues'), false, 'nothing is spent on a refused frame');
+});
