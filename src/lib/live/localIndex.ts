@@ -112,11 +112,29 @@ interface SqliteModule {
 
 let sqliteModule: SqliteModule | null = null;
 
+/**
+ * `node:sqlite`, obtained in the one way Turbopack cannot break.
+ *
+ * `createRequire(import.meta.url)('node:sqlite')` works under plain Node and
+ * fails under Turbopack with `Cannot find module 'node:sqlite': Unsupported
+ * external type Url for commonjs reference` — the bundler rewrites
+ * `import.meta.url` and the resulting require has no resolvable base. That made
+ * the entire street-match path return zero candidates in the running app while
+ * every test passed, because tests run on plain Node and never see the bundler.
+ * A failure invisible to CI and fatal in production is the worst kind, so the
+ * lookup is now bundler-proof rather than merely re-ordered.
+ *
+ * `process.getBuiltinModule` (Node >= 22.14) exists precisely for this: it
+ * returns a builtin without going through module resolution at all, so there is
+ * nothing for a bundler to rewrite. `createRequire` stays as the fallback for
+ * older runtimes, and both paths still surface a typed failure rather than
+ * throwing, because a runtime without node:sqlite is a configuration problem the
+ * operator has to be told about.
+ */
 function sqlite(): SqliteModule {
   if (!sqliteModule) {
-    // Required lazily so that merely importing this module never fails on a
-    // runtime without node:sqlite — the caller gets a typed failure instead.
-    sqliteModule = createRequire(import.meta.url)('node:sqlite') as SqliteModule;
+    const builtin = process.getBuiltinModule?.('node:sqlite') as SqliteModule | undefined;
+    sqliteModule = builtin ?? (createRequire(import.meta.url)('node:sqlite') as SqliteModule);
   }
   return sqliteModule;
 }
@@ -171,9 +189,18 @@ interface CacheEntry {
  */
 const cache = new Map<string, CacheEntry>();
 
-/** Drops the parsed-index cache. Tests use it; nothing in the app path needs it. */
+/**
+ * Drops cached state. Tests use it; nothing in the app path needs it.
+ *
+ * Clears the memoised `node:sqlite` handle as well as the parsed indexes, so a
+ * test can observe *how* the module is acquired. Without that, the first test to
+ * touch an index fixes the handle for the whole file and the acquisition path
+ * becomes unobservable — which is precisely the blind spot that let the
+ * Turbopack failure ship.
+ */
 export function clearLocalIndexCache(): void {
   cache.clear();
+  sqliteModule = null;
 }
 
 export function resolveLocalIndexPath(env: EnvLike = process.env): string | null {

@@ -566,3 +566,44 @@ test('refineInRegion over an EMPTY local index returns zero candidates and a sta
     false,
   );
 });
+
+/**
+ * REGRESSION GUARD — the bug this catches cost the product every street result.
+ *
+ * `createRequire(import.meta.url)('node:sqlite')` resolves fine under plain Node
+ * and throws under Turbopack ("Unsupported external type Url for commonjs
+ * reference"). Because every test in this file runs on plain Node, the entire
+ * suite passed while `/api/refine` returned zero candidates in the running app,
+ * for weeks. A test that merely opens an index cannot see the difference.
+ *
+ * So this asserts the *acquisition strategy* rather than the outcome:
+ * `process.getBuiltinModule` must be consulted first, because it is the one
+ * lookup a bundler cannot rewrite. If someone reorders these and puts
+ * `createRequire` back in front, this fails here instead of silently in
+ * production.
+ */
+test('node:sqlite is acquired via process.getBuiltinModule, not createRequire', () => {
+  clearLocalIndexCache();
+  const file = makeIndex({ rows: [{ id: 'g1', lat: 41.02, lon: -73.63, vector: basis(0) }] });
+
+  const original = process.getBuiltinModule;
+  let consulted = false;
+  try {
+    process.getBuiltinModule = ((id: string) => {
+      if (id === 'node:sqlite') consulted = true;
+      return original.call(process, id as 'node:sqlite');
+    }) as typeof process.getBuiltinModule;
+    const result = loadLocalIndex(file);
+    assert.equal(result.ok, true, 'the index must still load');
+  } finally {
+    process.getBuiltinModule = original;
+  }
+
+  assert.equal(
+    consulted,
+    true,
+    'process.getBuiltinModule("node:sqlite") was never called \u2014 the loader has ' +
+      'reverted to a bundler-fragile require and Turbopack will return zero ' +
+      'candidates in the running app while this suite stays green.',
+  );
+});

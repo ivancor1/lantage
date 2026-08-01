@@ -22,3 +22,7 @@ data/harvest/
 research/
 .lantage-uploads/
 .lantage-models/
+
+# Query-side descriptor cache: derived, large, and rebuilt by run_eval.py on demand.
+# The query SETS beside it are committed — they are the eval protocol and must be pinned.
+data/eval/embed_cache.json
