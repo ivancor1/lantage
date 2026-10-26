@@ -52,6 +52,7 @@ import { Budget, type Bbox, type ImageRef, type StageContext } from '@/lib/casca
 import { clueEvidence } from '@/lib/cascade/vlmClues';
 import { type Geocoder, NominatimGeocoder, cropUrl } from '@/lib/verify/ocrGeocode';
 import { type CapabilityGap, type LiveAnalyzeRequest, VISION_GAP } from './contract';
+import { ensureAnalysable, formatLabel, undecodableGap, undecodableRefusal } from './imageDecode';
 // Explicit `/index`: the unit tests run on Node's type-stripping loader, whose
 // shim appends `.ts` to an extensionless relative specifier and would resolve
 // './vision' to a non-existent './vision.ts' rather than to the directory.
@@ -247,15 +248,42 @@ export async function locate(input: LocateInput, deps: LocateDeps = {}): Promise
     stages.push({ stage: 'preprocess', ranMs: Date.now() - preprocessStart, costUsd: 0 });
   }
 
-  // --- 2. quality gate ----------------------------------------------------
+  // --- 2. decode + quality gate -------------------------------------------
   const gateStart = Date.now();
-  const image: ImageRef = {
+  const original: ImageRef = {
     imageId: uploadId,
     bytes: input.bytes,
     ...(input.mime ? { mimeType: input.mime } : {}),
   };
-  const quality =
-    input.quality ?? evaluateQualityGate({ image, header, metadata, bytes: input.bytes });
+  // HEIC is the iPhone default and libvips in this build cannot decode it — see
+  // `./imageDecode.ts`. The metadata above was read from the file as uploaded;
+  // from here on the pixels come from whatever could actually decode it.
+  const prepared = await ensureAnalysable(original, header);
+  const image = prepared.image;
+  if (prepared.decoded) {
+    models.decoder = `${prepared.decoded.decoder}; decoded ${formatLabel(header.format)} to ${prepared.decoded.width}x${prepared.decoded.height} in ${prepared.decoded.ranMs} ms`;
+  }
+  let quality =
+    input.quality ?? evaluateQualityGate({ image: original, header, metadata, bytes: input.bytes });
+  if (prepared.failure) {
+    // Undecodable is the "we cannot analyse this" case the gate is for. Failing
+    // it here means the contract invariant does the rest: a failed gate returns
+    // the refusal, never a ranking.
+    quality = {
+      ...quality,
+      passed: false,
+      components: {
+        ...quality.components,
+        resolutionPx: {
+          w: header.width ?? quality.components.resolutionPx.w,
+          h: header.height ?? quality.components.resolutionPx.h,
+        },
+      },
+      degraded: true,
+      refusalReason: undecodableRefusal(prepared.failure),
+    };
+    gaps.push(undecodableGap(prepared.failure));
+  }
   if (!callerAlreadyMeasured) {
     stages.push({
       stage: 'quality-gate',

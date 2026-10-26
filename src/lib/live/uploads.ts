@@ -27,6 +27,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readImageHeader } from '@/lib/cascade/imageHeader';
 import type { UploadRecord } from './contract';
+import { decodeToJpeg } from './imageDecode';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -277,9 +278,14 @@ interface MeasuredPixels {
  * True pixel dimensions.
  *
  * The decoder is asked first because it is authoritative for TIFF and for
- * orientation; the container header is the fallback and is authoritative for
- * HEIC, which the bundled libvips cannot decode (its HEIF input is AVIF-only).
- * Both are facts about the bytes. EXIF `ExifImageWidth` is not consulted.
+ * orientation; the container header is the fallback. Both are facts about the
+ * bytes. EXIF `ExifImageWidth` is not consulted.
+ *
+ * `sharp(...).metadata()` works on HEIC even though `toBuffer()` does not: libvips
+ * parses the HEIF container to answer a metadata query and only needs an HEVC
+ * decoder to produce pixels, and this build has none (see `./imageDecode.ts`).
+ * So the dimensions here are trustworthy for HEIC while the preview beside them
+ * needed a second decoder entirely.
  */
 export async function measurePixels(bytes: Uint8Array): Promise<MeasuredPixels> {
   const sharp = await loadSharp();
@@ -465,27 +471,41 @@ export async function storeUpload(input: {
 }
 
 /**
- * A downscaled JPEG for display. Returns null when the decoder is unavailable or
- * cannot read the container (HEIC, most notably) — in which case the original
- * bytes are served instead and the operator's browser decides.
+ * A downscaled JPEG for display, or null when no decoder could read the bytes.
+ *
+ * The second attempt is why this matters for HEIC specifically. libvips advertises
+ * HEIF input and reads the header, then fails the moment pixels are requested
+ * because the build has no HEVC decoder — so the first attempt threw, this
+ * returned null, and `readUploadForServing` fell back to handing the browser the
+ * raw HEIC. Safari renders that; Chrome and Firefox show a broken image. The
+ * operator's own photograph was invisible in their own workbench.
  */
 async function renderPreview(bytes: Uint8Array): Promise<Buffer | null> {
   const sharp = await loadSharp();
   if (!sharp) return null;
-  try {
-    return await sharp(bytes, { failOn: 'none', pages: 1 })
-      .rotate()
-      .resize({
-        width: PREVIEW_LONG_EDGE_PX,
-        height: PREVIEW_LONG_EDGE_PX,
-        fit: 'inside',
-        withoutEnlargement: true,
-      })
-      .jpeg({ quality: 82, mozjpeg: true })
-      .toBuffer();
-  } catch {
-    return null;
-  }
+
+  const encode = async (source: Uint8Array): Promise<Buffer | null> => {
+    try {
+      return await sharp(source, { failOn: 'none', pages: 1 })
+        .rotate()
+        .resize({
+          width: PREVIEW_LONG_EDGE_PX,
+          height: PREVIEW_LONG_EDGE_PX,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality: 82, mozjpeg: true })
+        .toBuffer();
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = await encode(bytes);
+  if (direct) return direct;
+
+  const decoded = await decodeToJpeg(bytes);
+  return decoded.ok ? encode(decoded.value.bytes) : null;
 }
 
 /** Write-then-rename, so a crash mid-write cannot leave a half file under a real id. */

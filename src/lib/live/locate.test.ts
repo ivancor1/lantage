@@ -789,6 +789,54 @@ test('a caller-supplied quality gate is trusted rather than re-run and re-report
   assert.equal(standalone.stages.some((s) => s.stage === 'quality-gate'), true);
 });
 
+/**
+ * A HEIC container that parses but does not decode. The header is deliberately
+ * good — brand `heic`, one unambiguous 1600x1200 `ispe`, over the byte floor —
+ * so the gate would pass it and the refusal below can only come from the decode.
+ */
+function undecodableHeic(): Uint8Array {
+  const u32 = (v: number): number[] => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+  const box = (type: string, payload: readonly number[]): number[] => [
+    ...u32(8 + payload.length),
+    ...[...type].map((c) => c.charCodeAt(0)),
+    ...payload,
+  ];
+  const full = (type: string, payload: readonly number[]): number[] => box(type, [0, 0, 0, 0, ...payload]);
+  const bytes = new Uint8Array(8_192);
+  bytes.set(
+    [
+      ...box('ftyp', [...[...'heic'].map((c) => c.charCodeAt(0)), ...u32(0)]),
+      ...full('meta', box('iprp', box('ipco', full('ispe', [...u32(1600), ...u32(1200)])))),
+    ],
+    0,
+  );
+  return bytes;
+}
+
+test('an undecodable HEIC refuses the gate and reports it as a capability gap', async () => {
+  const result = await locate(
+    { uploadId: 'up_heic', bytes: undecodableHeic(), mime: 'image/heic' },
+    {
+      provider: stubProvider({ ok: true, value: { clues: clues() } }),
+      geocoder: stubGeocoder({ Pittsburgh: PITTSBURGH }),
+      readTechniqueDoc: noTechniqueDoc,
+      env: {},
+    },
+  );
+
+  assert.equal(result.geo.length, 0, 'no pixels were read, so there is nothing to rank');
+  assert.equal(result.quality.passed, false);
+  assert.match(result.quality.refusalReason ?? '', /could not be decoded/);
+  assert.equal(
+    result.stages.some((s) => s.stage === 'vlm-clues'),
+    false,
+    'nothing is spent on a frame that never decoded',
+  );
+  const gap = result.gaps.find((g) => /HEIC/.test(g.capability));
+  assert.ok(gap, 'the operator has to see this above the fold, not only in the trace');
+  assert.match(gap?.impact ?? '', /NO analysis ran/);
+});
+
 test('a caller-supplied refusal still returns no ranking', async () => {
   const result = await locate(
     {

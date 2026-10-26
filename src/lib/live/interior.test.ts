@@ -332,9 +332,94 @@ test('unreadable bytes produce a refusal instead of a throw', async () => {
 });
 
 test('with no bytes the metadata stage is skipped with a stated reason', async () => {
-  const result = await run({ image: { imageId: 'test-image' } });
+  const result = await analyzeInterior({
+    image: { imageId: 'test-image' },
+    provider: fakeVlm(ukClues()),
+    provenanceProviders: [],
+    env: {},
+  });
   const preprocess = result.stages.find((s) => s.stage === 'preprocess');
   assert.match(preprocess?.skipped?.reason ?? '', /No image bytes/);
+});
+
+test('a caller-supplied gate suppresses the duplicate preprocess row', async () => {
+  // The orchestrator runs preprocess and the quality gate before dispatching and
+  // passes the verdict in. Emitting a second `preprocess` row here put two rows
+  // with the same stage id in the readout, which React keys by stage —
+  // "Encountered two children with the same key". LOCATE already honoured this;
+  // INTERIOR did not.
+  const measuredByCaller = await run();
+  assert.deepEqual(
+    measuredByCaller.stages.map((s) => s.stage),
+    ['vlm-clues', 'provenance'],
+  );
+
+  const measuredHere = await analyzeInterior({
+    image: { imageId: 'test-image', bytes: STUB_BYTES, mimeType: 'image/jpeg' },
+    provider: fakeVlm(ukClues()),
+    provenanceProviders: [],
+    env: {},
+  });
+  assert.deepEqual(
+    measuredHere.stages.map((s) => s.stage),
+    ['preprocess', 'vlm-clues', 'provenance'],
+    'without a caller gate INTERIOR still measures and reports the stage itself',
+  );
+  assert.equal(
+    new Set(measuredHere.stages.map((s) => s.stage)).size,
+    measuredHere.stages.length,
+    'a stage id may appear at most once in one response',
+  );
+});
+
+/**
+ * A HEIC container whose header parses cleanly — brand `heic`, one unambiguous
+ * `ispe` of 1600x1200, comfortably over the gate's byte floor — behind which
+ * there is no decodable image. It is built this way on purpose: the quality gate
+ * would otherwise PASS it, so the refusal below can only come from the decode.
+ */
+function undecodableHeic(): Uint8Array {
+  const u32 = (v: number): number[] => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+  const box = (type: string, payload: readonly number[]): number[] => [
+    ...u32(8 + payload.length),
+    ...[...type].map((c) => c.charCodeAt(0)),
+    ...payload,
+  ];
+  const full = (type: string, payload: readonly number[]): number[] => box(type, [0, 0, 0, 0, ...payload]);
+  const head = [
+    ...box('ftyp', [...[...'heic'].map((c) => c.charCodeAt(0)), ...u32(0)]),
+    ...full('meta', box('iprp', box('ipco', full('ispe', [...u32(1600), ...u32(1200)])))),
+  ];
+  const bytes = new Uint8Array(8_192);
+  bytes.set(head, 0);
+  return bytes;
+}
+
+test('an image that cannot be decoded refuses, states a gap, and ranks nothing', async () => {
+  // The failure this pins: the decode error reached the stage trace and nowhere
+  // else, the gate still said "passed", and the operator read a normal-looking
+  // result whose core analysis had never run.
+  const result = await analyzeInterior({
+    image: { imageId: 'heic-upload', bytes: undecodableHeic(), mimeType: 'image/heic' },
+    provider: fakeVlm(ukClues()),
+    provenanceProviders: [],
+    env: {},
+  });
+
+  assert.deepEqual(result.geo, [], 'an undecodable frame cannot produce candidates');
+  assert.equal(result.quality.passed, false, 'the gate is the thing the UI shows above the fold');
+  assert.match(result.quality.refusalReason ?? '', /could not be decoded/);
+  assert.match(result.quality.refusalReason ?? '', /HEIC\/HEIF/, 'name the format');
+
+  const gap = result.unavailable.find((g) => /HEIC/.test(g.capability));
+  assert.ok(gap, 'the failure must reach the capabilities panel, not only the stage trace');
+  assert.match(gap?.impact ?? '', /NO analysis ran/);
+  assert.match(gap?.howTo ?? '', /JPEG|PNG/);
+
+  const vlm = result.stages.find((s) => s.stage === 'vlm-clues');
+  assert.match(vlm?.skipped?.reason ?? '', /could not be decoded/);
+  assert.equal(vlm?.costUsd, 0, 'nothing may be spent on a frame that was never decoded');
+  assert.equal(result.costUsd, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -421,7 +506,9 @@ test('vlm cost is recorded only for the vendor whose price we actually know', as
 test('every stage reports a real elapsed time and the model/source versions are recorded', async () => {
   const result = await run({ provider: fakeVlm(ukClues(), 'gemini:gemini-3-flash') });
   const stageNames = result.stages.map((s) => s.stage);
-  assert.deepEqual(stageNames, ['preprocess', 'vlm-clues', 'provenance']);
+  // No `preprocess`: `run()` supplies the caller's gate, so the caller already
+  // reported that row. See 'a caller-supplied gate suppresses the duplicate…'.
+  assert.deepEqual(stageNames, ['vlm-clues', 'provenance']);
   for (const stage of result.stages) {
     assert.equal(typeof stage.ranMs, 'number');
     assert.ok(stage.ranMs >= 0);

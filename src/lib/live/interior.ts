@@ -38,7 +38,7 @@ import {
 } from '@/lib/contracts/types';
 import type { VlmClues } from '@/lib/contracts/schemas';
 import { type WorkingCandidate, finaliseCandidates } from '@/lib/cascade/candidate';
-import { COSTS, MODEL_VERSIONS, RETRIEVAL, TIMEOUTS_MS } from '@/lib/cascade/config';
+import { COSTS, MODEL_VERSIONS, RETRIEVAL } from '@/lib/cascade/config';
 import { bboxCenter, bboxIntersection, bboxRadiusM, precisionForRadius } from '@/lib/cascade/geo';
 import { readImageHeader } from '@/lib/cascade/imageHeader';
 import { type MetadataFacts, extractMetadata } from '@/lib/cascade/preprocess';
@@ -49,6 +49,13 @@ import { cropUrl } from '@/lib/verify/ocrGeocode';
 // Owned by L1. Returns a provider for whichever vision key is set, or null.
 import { selectProvider } from '@/lib/live/vision';
 import type { CapabilityGap, LiveAnalyzeRequest, ProvenanceHit } from './contract';
+import {
+  type AnalysableImage,
+  ensureAnalysable,
+  formatLabel,
+  undecodableGap,
+  undecodableRefusal,
+} from './imageDecode';
 import {
   PROVENANCE_TIMEOUTS_MS,
   type EnvLike,
@@ -137,6 +144,29 @@ Return ONLY JSON matching this shape:
  * left of it.
  */
 export const INTERIOR_BUDGET_MS = 25_000;
+
+/**
+ * Per-call ceiling for the vision request.
+ *
+ * `TIMEOUTS_MS.vlm` is 6 s and its comment says why: it is sized for "Gemini 3
+ * Flash structured extraction, measured 2-4s" inside the cascade's 10 s
+ * six-stage budget. INTERIOR already opted out of that budget above and then
+ * kept its per-call timeout, which made the two disagree.
+ *
+ * That disagreement is not theoretical. Measured 2026-08-01 against the
+ * configured vendor (OpenAI) on a real 3024x4032 iPhone frame: the call was cut
+ * off at exactly 6,000 ms having produced nothing, and LOCATE's own bench note a
+ * few files over records 6.8-9.3 s for the same class of request. So on this
+ * vendor the old ceiling did not merely risk a timeout, it guaranteed one — every
+ * INTERIOR run would return zero candidates no matter what was in the frame.
+ *
+ * 30 s matches `LOCATE_TIMEOUTS_MS.vision`, which was set from that bench, and
+ * still leaves room inside the 25 s budget clamp for the reverse-image lookup
+ * running alongside it.
+ */
+export const INTERIOR_TIMEOUTS_MS = {
+  vlm: 30_000,
+} as const;
 
 /**
  * Radius floors, which are how precision is capped.
@@ -474,6 +504,14 @@ export interface InteriorAnalysis {
   sources: Record<string, string>;
   costUsd: number;
   /**
+   * The gate this run actually applied — the caller's when it supplied one, and
+   * INTERIOR's own otherwise. Returned (as LOCATE returns it) so a refusal
+   * decided in here reaches the response instead of being silently outvoted by
+   * the orchestrator's earlier verdict. That is what makes an undecodable image
+   * a visible refusal rather than an empty ranking.
+   */
+  quality: QualityGate;
+  /**
    * True only when a published copy was found or address text is legible in the
    * frame. False means: the regions below are the whole answer, and no method in
    * this module gets from here to a building.
@@ -501,21 +539,61 @@ export async function analyzeInterior(input: InteriorInput): Promise<InteriorAna
   const models: Record<string, string> = {};
   const sources: Record<string, string> = { gazetteer: resolver.name };
 
-  // --- 1. EXIF / XMP + quality ---------------------------------------------
+  // --- 1. EXIF / XMP + decode + quality ------------------------------------
+  //
+  // The caller (the LIVE orchestrator) runs preprocess and the quality gate
+  // before dispatching and passes the verdict in. When it has, this module does
+  // not emit its own `preprocess` row: two rows with the same `stage` are two
+  // rows keyed identically in the readout, which is where the browser's
+  // "Encountered two children with the same key, 'preprocess'" came from. LOCATE
+  // already worked this way; INTERIOR did not.
+  const callerAlreadyMeasured = input.quality !== undefined;
   const metaStarted = Date.now();
   const bytes = input.image.bytes;
   let metadata: MetadataFacts | null = null;
   let quality: QualityGate;
+  let prepared: AnalysableImage = { image: input.image };
 
   if (bytes && bytes.byteLength > 0) {
     metadata = await extractMetadata(bytes);
     sources.exif = EXIF_LIBRARY;
     const header = readImageHeader(bytes);
+    // EXIF is read from the file the operator uploaded; pixels come from whatever
+    // can actually decode it. Both are facts about the same upload, and keeping
+    // them separate is why a HEIC still yields camera make, model and capture
+    // time even when the decode is the thing that failed.
+    prepared = await ensureAnalysable(input.image, header);
+    if (prepared.decoded) {
+      sources.decoder = `${prepared.decoded.decoder}; decoded ${formatLabel(header.format)} to ${prepared.decoded.width}x${prepared.decoded.height} in ${prepared.decoded.ranMs} ms`;
+    }
     quality =
       input.quality ??
       evaluateQualityGate({ image: input.image, header, metadata, bytes });
+    if (prepared.failure) {
+      // An undecodable image is exactly the "we cannot analyse this" case the
+      // gate exists for, so it fails the gate outright rather than being noted
+      // beside a passing one. That also buys the contract invariant for free:
+      // `assertRefusalIsHonoured` forbids a ranking on a failed gate, so there
+      // is no path from here to a candidate list.
+      quality = {
+        ...quality,
+        passed: false,
+        components: {
+          ...quality.components,
+          resolutionPx: {
+            w: header.width ?? quality.components.resolutionPx.w,
+            h: header.height ?? quality.components.resolutionPx.h,
+          },
+        },
+        degraded: true,
+        refusalReason: undecodableRefusal(prepared.failure),
+      };
+      unavailable.push(undecodableGap(prepared.failure));
+    }
     evidence.push(...interiorMetadataEvidence(metadata));
-    stages.push({ stage: 'preprocess', ranMs: Date.now() - metaStarted, costUsd: 0 });
+    if (!callerAlreadyMeasured) {
+      stages.push({ stage: 'preprocess', ranMs: Date.now() - metaStarted, costUsd: 0 });
+    }
   } else {
     quality =
       input.quality ?? {
@@ -525,15 +603,17 @@ export async function analyzeInterior(input: InteriorInput): Promise<InteriorAna
           'The image bytes were not available to this module, so nothing could be measured and no ranking is returned.',
         degraded: true,
       };
-    stages.push({
-      stage: 'preprocess',
-      ranMs: Date.now() - metaStarted,
-      costUsd: 0,
-      skipped: {
-        reason:
-          'No image bytes were supplied, so EXIF/XMP could not be read. Metadata is the only local signal available for an indoor frame and it was skipped.',
-      },
-    });
+    if (!callerAlreadyMeasured) {
+      stages.push({
+        stage: 'preprocess',
+        ranMs: Date.now() - metaStarted,
+        costUsd: 0,
+        skipped: {
+          reason:
+            'No image bytes were supplied, so EXIF/XMP could not be read. Metadata is the only local signal available for an indoor frame and it was skipped.',
+        },
+      });
+    }
   }
 
   // --- 2 + 4. Vision and reverse image search, concurrently ----------------
@@ -542,7 +622,7 @@ export async function analyzeInterior(input: InteriorInput): Promise<InteriorAna
   const provider = input.provider === undefined ? await resolveVisionProvider() : input.provider;
 
   const [clueOutcome, provenanceOutcome] = await Promise.all([
-    runClueExtraction(provider, input, budget),
+    runClueExtraction(provider, prepared, input, budget),
     runProvenance(input, budget, env),
   ]);
 
@@ -619,6 +699,7 @@ export async function analyzeInterior(input: InteriorInput): Promise<InteriorAna
     models,
     sources,
     costUsd,
+    quality,
     resolvableToBuilding: hasLocator,
   };
 }
@@ -636,10 +717,27 @@ interface ClueOutcome {
 
 async function runClueExtraction(
   provider: InteriorVlmProvider | null,
+  prepared: AnalysableImage,
   input: InteriorInput,
   budget: Budget,
 ): Promise<ClueOutcome> {
   const started = Date.now();
+
+  if (prepared.failure) {
+    // The gap and the refusal are already stated by the caller. What belongs
+    // here is the reason this specific stage did not run and did not spend.
+    return {
+      clues: null,
+      trace: {
+        stage: 'vlm-clues',
+        ranMs: Date.now() - started,
+        costUsd: 0,
+        skipped: {
+          reason: `The ${formatLabel(prepared.failure.format)} file could not be decoded to pixels, so there was nothing to send to the vision model and nothing was spent. ${prepared.failure.reason}`,
+        },
+      },
+    };
+  }
 
   if (!provider) {
     return {
@@ -662,7 +760,7 @@ async function runClueExtraction(
     };
   }
 
-  if (!input.image.bytes && !input.image.url) {
+  if (!prepared.image.bytes && !prepared.image.url) {
     return {
       clues: null,
       trace: {
@@ -676,8 +774,8 @@ async function runClueExtraction(
   let res: Result<VlmResult, StageFailure>;
   try {
     res = await provider.extractClues({
-      image: input.image,
-      timeoutMs: budget.timeoutFor(TIMEOUTS_MS.vlm),
+      image: prepared.image,
+      timeoutMs: budget.timeoutFor(INTERIOR_TIMEOUTS_MS.vlm),
       signal: input.signal,
       prompt: INTERIOR_CLUE_EXTRACTION_PROMPT,
     });

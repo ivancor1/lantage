@@ -14,6 +14,7 @@ import { CapabilityGaps } from './CapabilityGaps';
 import { EvidenceChain } from './EvidenceChain';
 import { FacePanel, type FaceProbeSource } from './FacePanel';
 import { GeoPanel } from './GeoPanel';
+import { Outcome } from './Outcome';
 import { VehiclePanel } from './VehiclePanel';
 import { ABSENT, formatBytes, formatIsoTime, shortHash } from './format';
 import { refusalViolation } from './integrity';
@@ -98,6 +99,10 @@ export function ResultsPanel({
             <p className="mt-2 text-[12px] leading-snug text-fg-secondary">{violation}</p>
           </section>
         ) : null}
+
+        {/* Above the gaps on purpose. A missing API key is a side note when the
+            real story is that the model looked and found nothing. */}
+        <Outcome analysis={analysis} className="mb-4" />
 
         <CapabilityGaps gaps={analysis.unavailable} provenanceNote="Reported by this run" className="mb-4" />
 
